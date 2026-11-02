@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-02): cinema layout, episode navigation and source access.
 'use client';
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -23,6 +24,7 @@ import type { PlayerSkipApi } from '@/components/player-shell';
 import { useToast } from '@/components/toast';
 import { enqueueDownload } from '@/components/download-manager';
 import { Icon } from '@/components/icon';
+import { SmartImage } from '@/components/smart-image';
 import { useAuth } from '@/components/auth';
 import { resolveSource, useAppStore } from '@/lib/store';
 import { qualityKey } from '@/lib/quality';
@@ -65,6 +67,9 @@ function WatchContent() {
   const [reversed, setReversed] = useState(false);
   const [switchOpen, setSwitchOpen] = useState(false);
   const [skipPanelOpen, setSkipPanelOpen] = useState(false);
+  const [cinema, setCinema] = useState(false);
+  const [episodeInput, setEpisodeInput] = useState('');
+  const [videoHeight, setVideoHeight] = useState(0);
   // 播放器对外暴露的精确时间读取接口（「记录当前」用），随播放器卸载置空
   const playerApiRef = useRef<PlayerSkipApi | null>(null);
   // 播放框：小屏「跳过标记」抽屉要按它的底边算剩余高度，避免压住画面
@@ -129,6 +134,8 @@ function WatchContent() {
     return indexParam;
   }, [episodes, indexParam]);
 
+  useEffect(() => setVideoHeight(0), [currentUrl]);
+
   // 跳过片段按剧名记忆：换集不变，换源到同名资源也能命中。
   // 标题缺失（直连链接）时退回 source:vodId，至少保证本源本片可用。
   const skipMarkFallback = `${sourceKey}:${vodId || currentUrl}`;
@@ -146,6 +153,8 @@ function WatchContent() {
 
   const goEpisode = useCallback(
     (index: number) => {
+      if (!Number.isInteger(index) || index < 0 || index >= episodes.length) return;
+      if (autoNextTimer.current) clearTimeout(autoNextTimer.current);
       const sp = new URLSearchParams(searchParams.toString());
       sp.set('index', String(index));
       sp.set('url', episodes[index] || directUrl);
@@ -238,6 +247,7 @@ function WatchContent() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (!e.altKey) return;
+      if ((e.target as HTMLElement).closest('input, textarea, select, [contenteditable="true"], [role="dialog"]')) return;
       if (e.key === 'ArrowLeft' && currentIndex > 0) {
         e.preventDefault();
         goEpisode(currentIndex - 1);
@@ -251,6 +261,7 @@ function WatchContent() {
   }, [currentIndex, episodes.length, goEpisode]);
 
   const orderedEpisodes = reversed ? [...episodes].map((_, i) => episodes.length - 1 - i) : episodes.map((_, i) => i);
+  const info = detailQuery.data?.videoInfo;
 
   if (!verified) {
     return (
@@ -275,21 +286,18 @@ function WatchContent() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <header className="sticky top-0 z-40 bg-surface/90 backdrop-blur border-b border-line">
-        <div className="max-w-7xl mx-auto px-4 h-14 flex items-center gap-3">
+    <div className={cn('watch-page min-h-screen flex flex-col', cinema && 'watch-cinema')}>
+      <header className="watch-header">
+        <div className="watch-header-inner">
           <BackButton />
           <HomeButton />
-          <div className="min-w-0">
-            <h1 className="text-sm font-medium text-content truncate">{videoTitle}</h1>
-            <p className="text-xs text-faint">
-              {source.name}
-              {episodes.length > 0 && ` · 第 ${currentIndex + 1}/${episodes.length} 集`}
-            </p>
-          </div>
-          <div className="ml-auto flex items-center gap-2">
+          <Link href="/" className="watch-brand">Libre<span>TV</span></Link>
+          <span className="watch-header-label">观影室</span>
+          <div className="ml-auto flex items-center gap-2 shrink-0">
+            <Link href="/live" className="watch-header-link">电视直播</Link>
             <button
-              className="btn-ghost btn-sm"
+              className="watch-action watch-download"
+              disabled={!currentUrl}
               onClick={() => {
                 if (!currentUrl) return;
                 enqueueDownload({
@@ -302,23 +310,24 @@ function WatchContent() {
                 // 这里先提示的话，用户随后取消保存位置会出现「已加入→已取消」的矛盾
               }}
             >
-              下载本集
-            </button>
-            <button className="btn-ghost btn-sm" onClick={() => setSwitchOpen(true)}>
-              切换资源
+              <Icon name="download" className="w-4 h-4" />下载本集
             </button>
           </div>
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-4">
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-4">
-          <div>
-            <div ref={playerFrameRef} className="aspect-video bg-black rounded-lg overflow-hidden">
+      <main className="watch-main flex-1">
+        <div className="watch-layout">
+          <section className="min-w-0" aria-label="视频播放">
+            <div ref={playerFrameRef} className="watch-frame">
               {currentUrl ? (
                 <PlayerShell
                   url={currentUrl}
                   title={videoTitle}
+                  sourceName={source.name}
+                  episodeCount={episodes.length}
+                  currentEpisode={currentIndex}
+                  onSelectEpisode={goEpisode}
                   adFilter={store.adFilter}
                   autoplayNext={store.autoplayNext}
                   skipMark={skipMark}
@@ -334,11 +343,13 @@ function WatchContent() {
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}
                   onEnded={handleEnded}
+                  onRequestSwitchSource={() => setSwitchOpen(true)}
                   hasPrevEpisode={currentIndex > 0}
                   hasNextEpisode={episodes.length > 0 && currentIndex < episodes.length - 1}
                   onPrevEpisode={() => goEpisode(currentIndex - 1)}
                   onNextEpisode={() => goEpisode(currentIndex + 1)}
                   onQuality={(height) => {
+                    setVideoHeight(height);
                     // 播放实测是最权威的画质来源，回写后搜索列表里该「源 + 影片」直接显示
                     if (!sourceKey || !vodId) return;
                     useAppStore.getState().setQuality({
@@ -360,23 +371,30 @@ function WatchContent() {
             </div>
 
             {/* 操作栏 */}
-            <div className="flex flex-wrap items-center gap-2 mt-3">
+            <div className="watch-toolbar">
               <button
-                className="btn-ghost btn-sm"
+                className={cn('watch-action', cinema && 'is-selected')}
+                aria-pressed={cinema}
+                onClick={() => setCinema((v) => !v)}
+              >
+                <Icon name="screen" className="w-4 h-4" />{cinema ? '退出影院' : '影院模式'}
+              </button>
+              <button
+                className="watch-action"
                 disabled={currentIndex <= 0}
                 onClick={() => goEpisode(currentIndex - 1)}
               >
                 上一集
               </button>
               <button
-                className="btn-ghost btn-sm"
+                className="watch-action"
                 disabled={episodes.length === 0 || currentIndex >= episodes.length - 1}
                 onClick={() => goEpisode(currentIndex + 1)}
               >
                 下一集
               </button>
               <button
-                className={cn('btn-ghost btn-sm', skipPanelOpen && 'bg-chip text-content')}
+                className={cn('watch-action', skipPanelOpen && 'is-selected')}
                 aria-expanded={skipPanelOpen}
                 aria-haspopup="dialog"
                 onClick={() => setSkipPanelOpen((v) => !v)}
@@ -386,20 +404,36 @@ function WatchContent() {
                     : '标记片头 / 中段 / 片尾，供本剧各集自动跳过'
                 }
               >
-                跳过标记{markedCount > 0 ? ` (${markedCount})` : ''}
+                <Icon name="skip" className="w-4 h-4" />跳过片头片尾{markedCount > 0 ? ` (${markedCount})` : ''}
                 {markedCount > 0 && skipMark?.enabled === false && (
                   <span className="ml-1 inline-block size-1.5 rounded-full bg-faint" aria-label="本剧跳过已关闭" />
                 )}
               </button>
-              <label className="flex items-center gap-1.5 text-xs text-muted ml-auto cursor-pointer">
+              <label className="watch-autoplay">
                 <input
                   type="checkbox"
-                  className="h-3.5 w-3.5 accent-[#2563eb]"
+                  className="watch-switch"
                   checked={store.autoplayNext}
                   onChange={(e) => store.updateSettings({ autoplayNext: e.target.checked })}
                 />
                 自动连播
               </label>
+            </div>
+
+            <div className="watch-info">
+              <div className="flex flex-wrap items-center gap-3">
+                <h1 className="text-xl sm:text-2xl font-semibold tracking-tight text-content">{videoTitle}</h1>
+                <span className="watch-now">{episodes.length > 1 ? `正在播放 · 第 ${currentIndex + 1} 集` : '正在播放'}</span>
+              </div>
+              <div className="watch-meta">
+                {[info?.year, info?.area, info?.typeName, info?.remarks].filter(Boolean).map((text, i) => <span key={i}>{text}</span>)}
+                {videoHeight > 0 && <span className="watch-quality">{videoHeight}P</span>}
+              </div>
+              <details className="watch-description">
+                <summary>影片简介与快捷键 <Icon name="chevronDown" className="w-3.5 h-3.5" /></summary>
+                {info?.desc && <p>{info.desc.replace(/<[^>]*>|&nbsp;/gi, ' ').replace(/\s+/g, ' ')}</p>}
+                <p className="watch-keyboard"><kbd>空格</kbd> 播放 / 暂停 <kbd>← →</kbd> 快退 / 快进 <kbd>F</kbd> 全屏 <kbd>Alt + ← →</kbd> 切集</p>
+              </details>
             </div>
 
             <SkipMarkPanel
@@ -421,18 +455,28 @@ function WatchContent() {
                 };
               }}
             />
-          </div>
+          </section>
 
           {/* 剧集侧栏 */}
-          <aside className="bg-surface-raised rounded-lg p-3 h-fit">
-            <div className="flex items-center justify-between gap-2 mb-2.5">
-              <h2 className="text-sm font-semibold text-content">
-                剧集列表{episodes.length > 0 && `（${episodes.length}）`}
+          <aside className="watch-sidebar" aria-label="剧集与播放线路">
+            <div className="watch-source-card">
+              <div className="watch-source-heading"><span className="watch-dot" />当前播放线路</div>
+              <div className="flex items-center justify-between gap-3 mt-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-content truncate">{source.name}</p>
+                  <p className="text-xs text-faint mt-1">卡顿或无法播放时可以换一条线路</p>
+                </div>
+                <button className="watch-source-switch" onClick={() => setSwitchOpen(true)}><Icon name="refresh" className="w-3.5 h-3.5" />换源</button>
+              </div>
+            </div>
+            <div className="watch-episode-heading">
+              <h2 className="text-base font-semibold text-content">
+                选集 <span className="text-xs text-faint font-normal ml-1">{episodes.length > 0 && `共 ${episodes.length} 集`}</span>
               </h2>
               {/* 排列开关紧贴它所作用的列表：放在这里才看得出它管的是这一栏的顺序 */}
               {episodes.length > 1 && (
                 <button
-                  className="btn-ghost btn-sm shrink-0"
+                  className="watch-action !px-2 shrink-0"
                   onClick={() => setReversed((v) => !v)}
                   aria-label={reversed ? '切换为正序排列' : '切换为倒序排列'}
                   title="调整剧集列表的排列顺序"
@@ -441,7 +485,7 @@ function WatchContent() {
                     name="arrowDown"
                     className={cn('w-3.5 h-3.5 transition-transform', reversed && 'rotate-180')}
                   />
-                  {reversed ? '正序排列' : '倒序排列'}
+                  {reversed ? '正序' : '倒序'}
                 </button>
               )}
             </div>
@@ -452,7 +496,7 @@ function WatchContent() {
                 <EmptyState variant="plain" title={detailQuery.isError ? '获取剧集失败' : '暂无剧集信息'} />
               )
             ) : (
-              <div className="grid grid-cols-5 lg:grid-cols-4 gap-1.5 max-h-[65vh] overflow-y-auto scrollbar-thin pr-1">
+              <div className="watch-episodes scrollbar-thin">
                 {orderedEpisodes.map((realIndex) => (
                   <EpisodeButton
                     key={realIndex}
@@ -463,9 +507,28 @@ function WatchContent() {
                 ))}
               </div>
             )}
-            <p className="hidden md:block text-[10px] text-faint mt-3 leading-relaxed">
-              快捷键：空格 播放/暂停 · ←/→ 快退/快进 5s · ↑/↓ 音量 · F 全屏 · Alt+←/→ 切换集数
-            </p>
+            {episodes.length > 1 && (
+              <form className="watch-episode-jump" onSubmit={(e) => {
+                e.preventDefault();
+                const index = Number(episodeInput) - 1;
+                if (episodeInput && Number.isInteger(index) && index >= 0 && index < episodes.length) {
+                  goEpisode(index);
+                  setEpisodeInput('');
+                }
+              }}>
+                <span>跳转至</span>
+                <input aria-label="跳转集数" type="number" min={1} max={episodes.length} step={1} placeholder={String(currentIndex + 1)} value={episodeInput} onChange={(e) => setEpisodeInput(e.target.value)} />
+                <span>集</span>
+                <button type="submit" className="watch-action ml-auto" disabled={!episodeInput}>前往</button>
+              </form>
+            )}
+            {currentIndex < episodes.length - 1 && (
+              <button className="watch-up-next" onClick={() => goEpisode(currentIndex + 1)}>
+                <span className="watch-next-cover"><SmartImage url={info?.cover} mode={store.imageProxyMode} customProxy={store.customImageProxy} alt="" className="w-full h-full object-cover" /><Icon name="play" className="w-5 h-5" /></span>
+                <span className="text-left"><span className="block text-xs text-faint mb-1">接下来播放</span><span className="block text-sm font-medium">第 {currentIndex + 2} 集</span></span>
+                <Icon name="skip" className="w-4 h-4 ml-auto text-muted" />
+              </button>
+            )}
           </aside>
         </div>
       </main>
@@ -488,16 +551,31 @@ function EpisodeButton({ index, active, onClick }: { index: number; active: bool
   const ref = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    if (active) ref.current?.scrollIntoView({ block: 'nearest' });
+    const button = ref.current;
+    const list = button?.parentElement;
+    if (!active || !button || !list) return;
+    // 只滚动选集列表，手机上不把整页带离视频画面。
+    const reveal = () => {
+      const box = button.getBoundingClientRect();
+      const viewport = list.getBoundingClientRect();
+      if (box.top < viewport.top) list.scrollTop += box.top - viewport.top - 3;
+      else if (box.bottom > viewport.bottom) list.scrollTop += box.bottom - viewport.bottom + 3;
+    };
+    reveal();
+    const observer = new ResizeObserver(reveal);
+    observer.observe(list);
+    return () => observer.disconnect();
   }, [active]);
 
   return (
     <button
       ref={ref}
-      className={cn('btn btn-sm !px-1', active ? 'episode-active' : 'btn-ghost')}
+      className={cn('watch-episode', active && 'is-active')}
+      aria-label={`播放第 ${index + 1} 集`}
+      aria-current={active ? 'true' : undefined}
       onClick={onClick}
     >
-      {index + 1}
+      {active && <span className="watch-equalizer" aria-hidden><i /><i /><i /></span>}{String(index + 1).padStart(2, '0')}
     </button>
   );
 }

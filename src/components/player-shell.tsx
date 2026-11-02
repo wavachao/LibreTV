@@ -1,8 +1,12 @@
+// Fork modification by wavachao (2026-11-02): accessible speed and episode menus inside the player.
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import Artplayer from 'artplayer';
 import Hls, { type HlsConfig } from 'hls.js';
+import { Icon } from './icon';
+import { useFocusTrap } from './use-focus-trap';
 
 import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
 import { createHlsLoader } from '@/lib/hls-loader';
@@ -57,6 +61,10 @@ export interface PlayerSkipApi {
 interface PlayerShellProps {
   url: string;
   title: string;
+  sourceName?: string;
+  episodeCount?: number;
+  currentEpisode?: number;
+  onSelectEpisode?: (index: number) => void;
   adFilter: boolean;
   autoplayNext: boolean;
   /** 当前剧的跳过片段标记（父级按归一化剧名查好后传入，换集/换源不变） */
@@ -102,6 +110,10 @@ interface PlayerShellProps {
 export function PlayerShell({
   url,
   title,
+  sourceName,
+  episodeCount = 0,
+  currentEpisode = 0,
+  onSelectEpisode,
   adFilter,
   autoplayNext,
   skipMark,
@@ -130,7 +142,20 @@ export function PlayerShell({
   const hlsRef = useRef<Hls | null>(null);
   const [error, setError] = useState('');
   const [hint, setHint] = useState('');
-  // 起播前的品牌占位图（沿用旧版 nomedia 素材），实际开始播放后隐藏
+  const [overlayHost, setOverlayHost] = useState<HTMLElement | null>(null);
+  const [menu, setMenu] = useState<'speed' | 'episodes' | null>(null);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const menuRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(menu !== null, menuRef);
+  useEffect(() => {
+    if (!menu) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); setMenu(null); }
+    };
+    document.addEventListener('keydown', close);
+    return () => document.removeEventListener('keydown', close);
+  }, [menu]);
+  // 起播占位仅在视频真正开始播放后隐藏。
   const [showPoster, setShowPoster] = useState(true);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -191,6 +216,12 @@ export function PlayerShell({
     setHint(text);
     if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
     hintTimerRef.current = setTimeout(() => setHint(''), 2500);
+  };
+
+  const requestSwitchSource = async (reason: string) => {
+    if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
+    if (artRef.current?.fullscreenWeb) artRef.current.fullscreenWeb = false;
+    propsRef.current.onRequestSwitchSource?.(reason);
   };
 
   // 片段缓存开启时调大 hls.js 自身缓冲，缓冲之外的空窗由预取器补齐
@@ -452,7 +483,7 @@ export function PlayerShell({
           const message = `${describeHlsError(data.type, data.details)}：${decision.reason}`;
           if (playbackStartedRef.current) {
             showHint(message);
-            propsRef.current.onRequestSwitchSource?.(decision.reason);
+            void requestSwitchSource(decision.reason);
           } else {
             setError(`视频加载失败，${message}，请尝试其他视频源`);
           }
@@ -510,6 +541,22 @@ export function PlayerShell({
 
     let lastSave = 0;
 
+    // 原生按钮保留 Tab / Enter / 空格操作，面板挂进播放器，浏览器全屏时仍可使用。
+    const speedButton = document.createElement('button');
+    speedButton.type = 'button';
+    speedButton.className = 'watch-control-label';
+    speedButton.textContent = '倍速';
+    speedButton.setAttribute('aria-label', '播放速度');
+    speedButton.setAttribute('aria-haspopup', 'dialog');
+    speedButton.onclick = () => setMenu((prev) => prev === 'speed' ? null : 'speed');
+    const episodeButton = document.createElement('button');
+    episodeButton.type = 'button';
+    episodeButton.className = 'watch-control-label';
+    episodeButton.textContent = '选集';
+    episodeButton.setAttribute('aria-label', '播放器内选集');
+    episodeButton.setAttribute('aria-haspopup', 'dialog');
+    episodeButton.onclick = () => setMenu((prev) => prev === 'episodes' ? null : 'episodes');
+
     const art = new Artplayer({
       container: containerRef.current,
       url: initialUrl,
@@ -530,11 +577,13 @@ export function PlayerShell({
       playsInline: true,
       airplay: true,
       hotkey: false,
-      theme: '#2563eb',
+      theme: '#38bdf8',
       lang: navigator.language.toLowerCase().startsWith('zh') ? 'zh-cn' : 'en',
       moreVideoAttr: { crossOrigin: 'anonymous', playsInline: true },
       // 上/下集放在播放键右侧：换集是看剧最高频的动作，不该让用户滚回页面下方找按钮
       controls: [
+        { name: 'quick-speed', index: 5, position: 'right', html: speedButton },
+        { name: 'episode-menu', index: 6, position: 'right', html: episodeButton },
         {
           name: 'prev-episode',
           index: 11,
@@ -563,6 +612,8 @@ export function PlayerShell({
       },
     });
     artRef.current = art;
+    art.template.$player.classList.add('watch-artplayer');
+    setOverlayHost(art.template.$player);
 
     // 进度条区间可视化：初始渲染一次，换集 duration 变化时重绘
     renderSkipMarks();
@@ -587,6 +638,8 @@ export function PlayerShell({
      */
     art.on('video:ratechange', () => {
       const video = art.video;
+      setPlaybackRate(video.playbackRate);
+      speedButton.textContent = video.playbackRate === 1 ? '倍速' : `${video.playbackRate}×`;
       if (video && video.playbackRate !== video.defaultPlaybackRate) {
         video.defaultPlaybackRate = video.playbackRate;
       }
@@ -765,7 +818,8 @@ export function PlayerShell({
     const shortcuts = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       // 输入框或按钮获得焦点时不劫持按键：否则空格会吞掉按钮的默认激活
-      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.closest('button')) return;
+      if (target.closest('input, textarea, select, button, [contenteditable="true"], [role="dialog"]')) return;
+      if (e.ctrlKey || e.metaKey) return;
       const current = artRef.current;
       if (!current) return;
       if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); return; } // 由父层处理集数切换
@@ -868,7 +922,7 @@ export function PlayerShell({
       // 松手后倍速永久卡在 3x；旧定时器句柄也会被覆盖成无法清除的幽灵触发
       if (isLongPress || longPressTimer) return;
       // 控制栏 / 设置面板上的长按不触发倍速（按住进度条拖动、长按倍速菜单项会误触）
-      if ((e.target as HTMLElement).closest?.('.art-controls, .art-settings')) return;
+      if ((e.target as HTMLElement).closest?.('.art-controls, .art-settings, .watch-player-menu')) return;
       originalRate = art.video.playbackRate;
       longPressTimer = setTimeout(() => {
         if (art.video?.paused) return;
@@ -954,7 +1008,8 @@ export function PlayerShell({
       name: 'next-episode',
       style: { opacity: hasNextEpisode ? '1' : '0.4', pointerEvents: hasNextEpisode ? 'auto' : 'none' },
     });
-  }, [hasPrevEpisode, hasNextEpisode, url]);
+    controls.update({ name: 'episode-menu', style: { display: episodeCount > 1 ? 'flex' : 'none' } });
+  }, [hasPrevEpisode, hasNextEpisode, episodeCount, url]);
 
   // —— 标记变化：重置采样基准并立即刷新提示 ——
   // 刚写入片段时当前时间可能恰好等于新边界，若沿用上一拍采样会被判成
@@ -994,18 +1049,38 @@ export function PlayerShell({
   }, [adFilter]);
 
   return (
-    <div className="relative w-full h-full">
+    <div className="watch-player relative w-full h-full">
       <div ref={containerRef} className="w-full h-full" style={{ WebkitTouchCallout: 'none' }} />
+      {overlayHost && createPortal(
+        <>
+          <div className="watch-player-title">
+            <span>{title}</span><span>{episodeCount > 1 ? `第 ${currentEpisode + 1} 集 · ` : ''}{sourceName}</span>
+          </div>
+          {menu && (
+            <div className="watch-menu-backdrop" onClick={() => setMenu(null)}>
+              <div ref={menuRef} role="dialog" aria-modal="true" aria-label={menu === 'speed' ? '播放速度' : '播放器内选集'} tabIndex={-1} className="watch-player-menu" onClick={(event) => event.stopPropagation()}>
+                <div className="watch-player-menu-heading">
+                  <h2>{menu === 'speed' ? '播放速度' : `选集 · 共 ${episodeCount} 集`}</h2>
+                  <button type="button" aria-label="关闭播放器面板" onClick={() => setMenu(null)}><Icon name="close" className="w-4 h-4" /></button>
+                </div>
+                <div className={menu === 'speed' ? 'watch-speed-options' : 'watch-player-episodes'}>
+                  {menu === 'speed'
+                    ? [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3].map((rate) => (
+                      <button key={rate} type="button" aria-pressed={playbackRate === rate} onClick={() => { if (artRef.current) artRef.current.playbackRate = rate; setMenu(null); }}>{rate === 1 ? '正常' : `${rate}×`}</button>
+                    ))
+                    : Array.from({ length: episodeCount }, (_, index) => (
+                      <button key={index} type="button" aria-label={`播放第 ${index + 1} 集`} aria-current={index === currentEpisode ? 'true' : undefined} onClick={() => { onSelectEpisode?.(index); setMenu(null); }}>{String(index + 1).padStart(2, '0')}</button>
+                    ))}
+                </div>
+              </div>
+            </div>
+          )}
       {showPoster && !error && (
-        <div
-          className="absolute inset-0 bg-black pointer-events-none"
-          style={{
-            backgroundImage: 'url(/player-poster.png)',
-            backgroundSize: 'contain',
-            backgroundPosition: 'center',
-            backgroundRepeat: 'no-repeat',
-          }}
-        />
+        <div className="absolute inset-0 bg-[#050a12] flex flex-col items-center justify-center gap-3 pointer-events-none" role="status">
+          <div className="w-8 h-8 rounded-full border-2 border-slate-700 border-t-sky-400 animate-spin" />
+          <p className="text-slate-200 text-sm">正在准备播放</p>
+          <p className="text-slate-400 text-xs">{sourceName || '正在连接播放线路'}</p>
+        </div>
       )}
       {!error && skipPrompt && (
         <button
@@ -1033,11 +1108,13 @@ export function PlayerShell({
         </button>
       )}
       {error && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/80">
-          <p className="text-danger text-sm">{error}</p>
-          <button className="btn-ghost text-xs" onClick={() => location.reload()}>
-            重新加载
-          </button>
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-4 bg-black/90 px-6 text-center">
+          <Icon name="alert" className="w-8 h-8 text-slate-400" />
+          <div><p className="text-white font-medium mb-2">这条线路暂时无法播放</p><p className="text-slate-400 text-xs">{error}</p></div>
+          <div className="flex gap-3">
+            <button className="btn-ghost text-xs" onClick={() => loadEpisode(propsRef.current.url)}>重试播放</button>
+            {onRequestSwitchSource && <button className="btn-primary text-xs" onClick={() => { void requestSwitchSource(error); }}>切换线路</button>}
+          </div>
         </div>
       )}
       {(hint || undoSkip) && (
@@ -1057,10 +1134,7 @@ export function PlayerShell({
           )}
         </div>
       )}
-      {autoplayNext && !error && (
-        <div className="absolute bottom-16 right-3 text-[10px] text-muted bg-black/50 px-2 py-0.5 rounded pointer-events-none">
-          自动连播已开启
-        </div>
+        </>, overlayHost
       )}
     </div>
   );

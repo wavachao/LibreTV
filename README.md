@@ -1,5 +1,9 @@
 # LibreTV
 
+> **Fork 修改版**：本仓库基于 [LibreSpark/LibreTV](https://github.com/LibreSpark/LibreTV)，由 [wavachao](https://github.com/wavachao) 维护个人改动。原项目及其贡献者保留原有署名，本仓库继续使用 [AGPL-3.0](LICENSE) 许可证。
+>
+> 本版主要改动：播放器观影室布局、影院模式、播放器内倍速与选集，以及临时网络断连的读取重试。改动日期和验证记录见 [FORK_NOTES.md](FORK_NOTES.md)。下方官网、演示站和文档链接属于上游项目。
+
 LibreTV Next.js 迁移版：免费在线视频聚合搜索与观看平台。基于 Next.js 15（App Router）+ TypeScript + Tailwind CSS，播放内核为 ArtPlayer + hls.js，支持亮暗双主题。
 
 > 🏠 **官网**：[LibreTV 官网](https://libretv.is-an.org/)

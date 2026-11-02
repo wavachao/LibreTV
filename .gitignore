@@ -12,3 +12,7 @@ vitest-results.json
 .zcode/
 .codebuddy/
 generated-images/
+
+# 本地部署覆盖与排查产物
+/docker-compose.override.yml
+/work/

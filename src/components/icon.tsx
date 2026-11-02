@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-02): add icons for viewing controls.
 import type { ReactNode } from 'react';
 
 /**
@@ -24,9 +25,15 @@ export type IconName =
   | 'link'
   | 'alert'
   | 'gear'
+  | 'screen'
+  | 'play'
+  | 'skip'
   | 'home';
 
 const PATHS: Record<IconName, ReactNode> = {
+  screen: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.7} d="M3 5h18v14H3V5Zm0 3h18M3 16h18" />,
+  play: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.7} d="m9 5 11 7-11 7V5Z" />,
+  skip: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.7} d="m4 5 11 7-11 7V5Zm15 0v14" />,
   close: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />,
   edit: (
     <path
