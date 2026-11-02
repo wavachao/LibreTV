@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-10-30): cover network retries and cancellation.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fetchUpstream } from './fetch-utils';
 
@@ -53,5 +54,30 @@ describe('fetchUpstream 安全跳转', () => {
       new Response(null, { status: 302, headers: { location: url } })
     ));
     await expect(fetchUpstream(PUBLIC_URL)).rejects.toThrow(/重定向次数过多/);
+  });
+});
+
+
+describe('fetchUpstream 网络重试', () => {
+  it('临时断连后重试读取，并使用新的单次超时 signal', async () => {
+    const spy = vi.fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(new Response('recovered'));
+    vi.stubGlobal('fetch', spy);
+    const res = await fetchUpstream(PUBLIC_URL);
+    expect(await res.text()).toBe('recovered');
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy.mock.calls[0][1].signal).not.toBe(spy.mock.calls[1][1].signal);
+  });
+
+  it('外部取消后不重试', async () => {
+    const controller = new AbortController();
+    const spy = vi.fn().mockImplementation(() => {
+      controller.abort();
+      throw new TypeError('fetch failed');
+    });
+    vi.stubGlobal('fetch', spy);
+    await expect(fetchUpstream(PUBLIC_URL, { signal: controller.signal })).rejects.toThrow('fetch failed');
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });

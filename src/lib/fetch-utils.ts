@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-10-30): retry transient upstream read failures.
 /** 服务端上游请求工具：超时、重试、安全跳转、JSON 解析 */
 
 import { checkLiveUrlAllowed, checkUpstreamAllowed } from './ssrf';
@@ -87,14 +88,14 @@ export async function fetchUpstream(url: string, options: FetchOptions = {}): Pr
 
 /** 同 fetchUpstream，额外返回重定向后的最终 URL */
 export async function fetchUpstreamWithMeta(url: string, options: FetchOptions = {}): Promise<FetchResult> {
-  const { timeoutMs = 8000, retries = 0, safeRedirects = true, allowPrivate = false, ...init } = options;
-  // 外部 signal（调用方的总死线中断）与单次超时合并：任一触发即中断请求
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  const signal = init.signal
-    ? AbortSignal.any([init.signal, timeoutSignal])
-    : timeoutSignal;
+  const { timeoutMs = 8000, retries = 2, safeRedirects = true, allowPrivate = false, ...init } = options;
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    // 每次尝试独立计时；调用方的总死线仍限制整个请求。
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const signal = init.signal
+      ? AbortSignal.any([init.signal, timeoutSignal])
+      : timeoutSignal;
     try {
       if (!safeRedirects) {
         const res = await fetch(url, {
@@ -107,6 +108,10 @@ export async function fetchUpstreamWithMeta(url: string, options: FetchOptions =
       // 手动逐跳跟随，每一跳重新过 SSRF 校验
       return await fetchWithSafeRedirects(url, { ...init, signal }, { allowPrivate });
     } catch (err) {
+      // 只重试幂等读取的网络断连；不重试安全拒绝、超时或用户取消。
+      const method = (init.method || 'GET').toUpperCase();
+      if (init.signal?.aborted || !['GET', 'HEAD'].includes(method)
+        || !(err instanceof TypeError) || err.message !== 'fetch failed') throw err;
       lastError = err;
     }
   }
