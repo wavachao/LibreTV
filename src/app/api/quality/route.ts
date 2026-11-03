@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-03): preserve complete media metadata through cache and streaming.
 import { NextResponse } from 'next/server';
 import { guardRequest } from '@/lib/api-guard';
 import { getCache, setCache } from '@/lib/fetch-utils';
@@ -27,10 +28,7 @@ const OK_CACHE_TTL = 30 * 60 * 1000;
 /** 失败结果短缓存：避免每个用户每次展开都去白打一遍已经挂掉的源 */
 const FAIL_CACHE_TTL = 2 * 60 * 1000;
 
-interface CachedProbe {
-  height?: number;
-  error?: string;
-}
+type CachedProbe = Omit<QualityProbeResult, 'sourceKey' | 'vodId'>;
 
 function isProbeItem(v: unknown): v is QualityProbeItem {
   if (!v || typeof v !== 'object') return false;
@@ -98,7 +96,7 @@ export async function POST(req: Request) {
     const key = cacheKey(item);
     const cached = getCache<CachedProbe>(key);
     if (cached) {
-      return { sourceKey: item.source.key, vodId: item.id, height: cached.height, error: cached.error };
+      return { ...cached, sourceKey: item.source.key, vodId: item.id };
     }
     let pending = inflight.get(key);
     if (!pending) {
@@ -108,7 +106,7 @@ export async function POST(req: Request) {
           // 只限单请求内的 CONCURRENCY 挡不住「多用户 × 单请求并发」的叠加冲击。
           // 排队等待不占用 probeQuality 内部的 8s 死线（超时在拿到名额后才起算）
           const result = await withHostLimit(item.source.url, () => probeQuality(item, req.signal));
-          const value: CachedProbe = { height: result.height, error: result.error };
+          const value: CachedProbe = result;
           // 「测不出」（height 缺失且无 error）同样是有效结论，也要缓存，
           // 否则单码率源每次展开都会被重复探测一遍
           setCache(key, value, result.error ? FAIL_CACHE_TTL : OK_CACHE_TTL);
@@ -121,7 +119,7 @@ export async function POST(req: Request) {
       inflight.set(key, pending);
     }
     const value = await pending;
-    return { sourceKey: item.source.key, vodId: item.id, height: value.height, error: value.error };
+    return { ...value, sourceKey: item.source.key, vodId: item.id };
   };
 
   if (!isStream) {

@@ -1,4 +1,4 @@
-// Fork modification by wavachao (2026-11-02): cinema layout, episode navigation and source access.
+// Fork modification by wavachao (2026-11-03): cinema layout, episode navigation and source access.
 'use client';
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -27,7 +27,8 @@ import { Icon } from '@/components/icon';
 import { SmartImage } from '@/components/smart-image';
 import { useAuth } from '@/components/auth';
 import { resolveSource, useAppStore } from '@/lib/store';
-import { qualityKey } from '@/lib/quality';
+import { qualityKey, qualityLabel, streamQualityText } from '@/lib/quality';
+import type { StreamQuality } from '@/lib/types';
 import {
   clearProgress,
   progressKeyOf,
@@ -55,7 +56,7 @@ function WatchContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const store = useAppStore();
-  const { verified } = useAuth();
+  const { verified, checked, openLogin } = useAuth();
   const { toast } = useToast();
 
   const sourceKey = searchParams.get('source') || '';
@@ -69,7 +70,7 @@ function WatchContent() {
   const [skipPanelOpen, setSkipPanelOpen] = useState(false);
   const [cinema, setCinema] = useState(false);
   const [episodeInput, setEpisodeInput] = useState('');
-  const [videoHeight, setVideoHeight] = useState(0);
+  const [streamInfo, setStreamInfo] = useState<StreamQuality>({});
   // 播放器对外暴露的精确时间读取接口（「记录当前」用），随播放器卸载置空
   const playerApiRef = useRef<PlayerSkipApi | null>(null);
   // 播放框：小屏「跳过标记」抽屉要按它的底边算剩余高度，避免压住画面
@@ -117,7 +118,10 @@ function WatchContent() {
     staleTime: 5 * 60_000,
   });
 
-  const episodes = useMemo(() => detailQuery.data?.episodes ?? [], [detailQuery.data]);
+  const lineParam = Math.max(0, parseInt(searchParams.get('line') || '0', 10) || 0);
+  const playLines = detailQuery.data?.playLines;
+  const lineIndex = Math.min(lineParam, Math.max(0, (playLines?.length ?? 1) - 1));
+  const episodes = useMemo(() => playLines?.[lineIndex]?.episodes ?? detailQuery.data?.episodes ?? [], [playLines, lineIndex, detailQuery.data]);
   const videoTitle = titleParam || detailQuery.data?.videoInfo?.title || '未知视频';
 
   // 当前播放地址：优先取剧集列表中的当前集，其次直连 URL 参数
@@ -134,7 +138,7 @@ function WatchContent() {
     return indexParam;
   }, [episodes, indexParam]);
 
-  useEffect(() => setVideoHeight(0), [currentUrl]);
+  useEffect(() => setStreamInfo({}), [currentUrl]);
 
   // 跳过片段按剧名记忆：换集不变，换源到同名资源也能命中。
   // 标题缺失（直连链接）时退回 source:vodId，至少保证本源本片可用。
@@ -266,7 +270,11 @@ function WatchContent() {
   if (!verified) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-faint text-sm">等待访问验证...</p>
+        <div className="text-center space-y-4">
+          <p className="text-faint text-sm">{checked ? '登录后继续观看' : '正在检查访问验证…'}</p>
+          {checked && <button className="btn-primary" onClick={openLogin}>访问验证</button>}
+          <Link href="/" className="block text-sm text-muted">返回首页</Link>
+        </div>
       </div>
     );
   }
@@ -336,9 +344,9 @@ function WatchContent() {
                   onPendingStart={setPendingStart}
                   onPlayerApi={(api) => { playerApiRef.current = api; }}
                   onRecordSegment={handleRecordSegment}
-                  episodeKey={`${sourceKey}:${vodId}:${currentIndex}`}
+                  episodeKey={`${sourceKey}:${vodId}:${lineIndex}:${currentIndex}`}
                   nextUrl={currentIndex + 1 < episodes.length ? episodes[currentIndex + 1] : undefined}
-                  nextEpisodeKey={currentIndex + 1 < episodes.length ? `${sourceKey}:${vodId}:${currentIndex + 1}` : undefined}
+                  nextEpisodeKey={currentIndex + 1 < episodes.length ? `${sourceKey}:${vodId}:${lineIndex}:${currentIndex + 1}` : undefined}
                   getRestorePosition={getRestorePosition}
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}
@@ -348,12 +356,12 @@ function WatchContent() {
                   hasNextEpisode={episodes.length > 0 && currentIndex < episodes.length - 1}
                   onPrevEpisode={() => goEpisode(currentIndex - 1)}
                   onNextEpisode={() => goEpisode(currentIndex + 1)}
-                  onQuality={(height) => {
-                    setVideoHeight(height);
+                  onQuality={(quality) => {
+                    setStreamInfo(quality);
                     // 播放实测是最权威的画质来源，回写后搜索列表里该「源 + 影片」直接显示
-                    if (!sourceKey || !vodId) return;
+                    if (!sourceKey || !vodId || !quality.height || !quality.width) return;
                     useAppStore.getState().setQuality({
-                      [qualityKey(sourceKey, vodId)]: { height, from: 'play', timestamp: Date.now() },
+                      [qualityKey(sourceKey, vodId)]: { ...quality, from: 'play', timestamp: Date.now() },
                     });
                   }}
                 />
@@ -427,7 +435,11 @@ function WatchContent() {
               </div>
               <div className="watch-meta">
                 {[info?.year, info?.area, info?.typeName, info?.remarks].filter(Boolean).map((text, i) => <span key={i}>{text}</span>)}
-                {videoHeight > 0 && <span className="watch-quality">{videoHeight}P</span>}
+                {streamInfo.height && <span className="watch-quality">{qualityLabel(streamInfo.height, streamInfo.width)} 尺寸</span>}
+              </div>
+              <div className="mt-3 text-xs text-muted leading-relaxed" aria-label="播放信息">
+                <p>{streamQualityText(streamInfo) || '播放信息将在媒体加载后显示'}</p>
+                <p className="text-faint mt-1">码率为最近分片采样，含音频与封装；不是整片平均值。未检测到 HDR 信息时不作判断。</p>
               </div>
               <details className="watch-description">
                 <summary>影片简介与快捷键 <Icon name="chevronDown" className="w-3.5 h-3.5" /></summary>
@@ -468,6 +480,18 @@ function WatchContent() {
                 </div>
                 <button className="watch-source-switch" onClick={() => setSwitchOpen(true)}><Icon name="refresh" className="w-3.5 h-3.5" />换源</button>
               </div>
+              {playLines && playLines.length > 1 && <label className="block text-xs text-muted mt-3">
+                本源播放线路
+                <select aria-label="本源播放线路" className="input w-full mt-1" value={lineIndex} onChange={(e) => {
+                  const sp = new URLSearchParams(searchParams.toString());
+                  sp.set('line', e.target.value);
+                  sp.delete('url');
+                  sp.delete('position');
+                  router.replace(`/watch?${sp.toString()}`, { scroll: false });
+                }}>
+                  {playLines.map((line, i) => <option key={i} value={i}>{line.name} · {line.episodes.length} 集</option>)}
+                </select>
+              </label>}
             </div>
             <div className="watch-episode-heading">
               <h2 className="text-base font-semibold text-content">

@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-03): accurate media information and source compatibility.
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -6,7 +7,7 @@ import { api } from '@/lib/client-api';
 import type { SourceConfig, SearchResultItem } from '@/lib/types';
 import { buildWatchUrl, cn } from '@/lib/utils';
 import { useAppStore, resolveSource } from '@/lib/store';
-import { qualityKey, qualityLabel } from '@/lib/quality';
+import { qualityKey, qualityLabel, streamQualityText } from '@/lib/quality';
 import { useToast } from './toast';
 import { Icon } from './icon';
 import { SmartImage } from './smart-image';
@@ -285,8 +286,8 @@ export function SwitchSourceModal({
               {phase === 'searching'
                 ? '正在搜索各资源...'
                 : phase === 'testing'
-                  ? '正在测试各资源速率...'
-                  : `共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.ok).length} 个可用`}
+                  ? '正在检查详情接口...'
+                  : `共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.ok).length} 个详情响应正常`}
             </p>
             {phase === 'done' && progress.total > 0 && (
               <p className="text-xs text-faint tabular-nums mt-0.5">
@@ -309,7 +310,7 @@ export function SwitchSourceModal({
         {/* 内容区独占剩余高度并自己滚动：标题与拖拽条始终可见，不随内容滚走 */}
         <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden scrollbar-thin">
         {phase !== 'done' ? (
-          <LoadingState label={phase === 'searching' ? '搜索各资源中...' : '测速中...'} />
+          <LoadingState label={phase === 'searching' ? '搜索各资源中...' : '检查详情接口中...'} />
         ) : sorted.length === 0 ? (
           <EmptyState variant="plain" title="其他点播源未找到同名资源" />
         ) : (
@@ -326,7 +327,8 @@ export function SwitchSourceModal({
                   const isCurrent = isCurrentCandidate(c, currentSourceKey, currentVodId);
                   const key = candidateKey(c);
                   const active = selected === c;
-                  const qLabel = qualityLabel(qualities[qualityKey(c.source.key, c.result.vodId)]?.height);
+                  const quality = qualities[qualityKey(c.source.key, c.result.vodId)];
+                  const qLabel = qualityLabel(quality?.height, quality?.width);
                   return (
                     <button
                       key={key}
@@ -405,14 +407,14 @@ export function SwitchSourceModal({
                     </div>
                     <div className="mt-2 grid grid-cols-2 gap-2 sm:max-w-[16rem]">
                       <div className="rounded-md bg-chip px-2 py-1.5">
-                        <div className="text-[10px] text-faint">速度</div>
+                        <div className="text-[10px] text-faint">详情接口响应</div>
                         <div
                           className={cn(
                             'text-xs font-medium tabular-nums',
                             !c.ok ? 'text-danger' : (c.ms ?? 0) > 2000 ? 'text-warning' : 'text-success'
                           )}
                         >
-                          {c.ok ? `${c.ms}ms` : '不可用'}
+                          {c.ok ? `${c.ms}ms` : '请求失败'}
                         </div>
                       </div>
                       <div className="rounded-md bg-chip px-2 py-1.5">
@@ -422,6 +424,8 @@ export function SwitchSourceModal({
                         </div>
                       </div>
                     </div>
+                    <p className="text-xs text-muted mt-2 break-words">{qualities[qKey] && streamQualityText(qualities[qKey])}</p>
+                    <p className="text-[10px] text-faint mt-1">接口响应时间不代表画质或播放速度；码率与编码以媒体探测和实际播放为准。</p>
                     <div className="mt-2.5 flex flex-wrap items-center gap-2">
                       {isCurrent ? (
                         <span className="text-xs text-accent">当前正在播放</span>
@@ -431,7 +435,7 @@ export function SwitchSourceModal({
                             切换到此源
                           </button>
                           {/* 测速失败但拿得到集数：允许点。详情接口偶发超时很常见，别把能播的源挡在外面 */}
-                          {!c.ok && !!c.episodes && <span className="text-xs text-warning">测速未通过，仍可尝试</span>}
+                          {!c.ok && !!c.episodes && <span className="text-xs text-warning">详情请求未通过，仍可尝试</span>}
                         </>
                       )}
                       {!c.ok && (
@@ -441,7 +445,7 @@ export function SwitchSourceModal({
                           disabled={retestingKey === key}
                           onClick={() => void retest(c)}
                         >
-                          {retestingKey === key ? '重测中...' : '重新测速'}
+                          {retestingKey === key ? '重测中...' : '重新检查接口'}
                         </button>
                       )}
                     </div>

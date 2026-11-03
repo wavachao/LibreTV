@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+// Fork modification by wavachao (2026-11-03): validate media dimensions and invalid-playlist handling.
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { probeEpisodeOrder, probeQuality } from './quality-probe';
 import type { SourceConfig } from './types';
 
@@ -6,6 +7,7 @@ const mocks = vi.hoisted(() => ({ fetchUpstream: vi.fn() }));
 vi.mock('./fetch-utils', () => ({ fetchUpstream: mocks.fetchUpstream }));
 // 探测 대상由用例自己提供，跳过 SSRF 校验（那是 ssrf.test.ts 的职责）
 vi.mock('./ssrf', () => ({ checkUpstreamAllowed: () => Promise.resolve({ ok: true }) }));
+beforeEach(() => { mocks.fetchUpstream.mockClear(); });
 
 /**
  * 集成测试：验证「m3u8 测不出 → 下沉到分片解析」这条降级链路真的接通。
@@ -204,6 +206,16 @@ describe('probeEpisodeOrder', () => {
 });
 
 describe('probeQuality 降级到分片解析', () => {
+  it('拒绝伪装成 m3u8 的 HTML 错误页', async () => {
+    currentPlaylist = '<!DOCTYPE html><h1>denied</h1>';
+    mocks.fetchUpstream.mockImplementation((url: string) => Promise.resolve(route(url)));
+    expect((await probeQuality({ source: SOURCE, id: '123' })).error).toContain('无效');
+  });
+  it('只有带宽的 master 继续探测子清单和实际分片，不猜测分辨率', async () => {
+    currentPlaylist = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nchild.m3u8\n';
+    mocks.fetchUpstream.mockImplementation((url: string) => Promise.resolve(url.endsWith('child.m3u8') ? new Response(SINGLE_TS) : route(url)));
+    expect(await probeQuality({ source: SOURCE, id: '123' })).toMatchObject({ width: 1920, height: 1080, codec: 'H.264' });
+  });
   it('多码率 master playlist 直接解析档位，不再下载分片', async () => {
     currentPlaylist = MASTER;
     mocks.fetchUpstream.mockImplementation((url: string) => Promise.resolve(route(url)));

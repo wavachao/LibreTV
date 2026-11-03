@@ -1,10 +1,10 @@
+// Fork modification by wavachao (2026-11-03): accurate media information and source compatibility.
 import { describe, expect, it } from 'vitest';
 import {
   QUALITY_FAIL_TTL_MS,
   QUALITY_TTL_MS,
   describeQualityBadge,
   failureReasonLabel,
-  inferHeightFromBitrate,
   isQualityEntryFresh,
   isRetryableTimeout,
   mergeQualityEntries,
@@ -59,6 +59,13 @@ describe('qualityLabel', () => {
     expect(qualityLabel(undefined)).toBeUndefined();
     expect(qualityLabel(0)).toBeUndefined();
   });
+  it('保留裁边电影长边，同时兼容竖屏及旧高度缓存', () => {
+    expect(qualityLabel(1504, 3840)).toBe('4K');
+    expect(qualityLabel(1608, 3840)).toBe('4K');
+    expect(qualityLabel(802, 1920)).toBe('1080P');
+    expect(qualityLabel(1280, 720)).toBe('720P');
+    expect(qualityLabel(1080)).toBe('1080P');
+  });
 });
 
 describe('parseBestHeight', () => {
@@ -66,12 +73,12 @@ describe('parseBestHeight', () => {
     expect(parseBestHeight(MASTER)).toBe(1080);
   });
 
-  it('只有 BANDWIDTH 的档位按转码参数反推高度', () => {
+  it('只有 BANDWIDTH 的档位不能证明分辨率', () => {
     const text = `#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=6000000
 only-bandwidth.m3u8
 `;
-    expect(parseBestHeight(text)).toBe(inferHeightFromBitrate(6_000_000));
+    expect(parseBestHeight(text)).toBeUndefined();
   });
 
   it('单码率媒体列表没有 STREAM-INF，返回 undefined 而非猜一个档位', () => {
@@ -195,6 +202,13 @@ describe('mergeQualityEntries', () => {
   const probe = (height?: number, error?: string): QualityEntry => ({ height, from: 'probe', error, timestamp: T });
   const play = (height: number): QualityEntry => ({ height, from: 'play', timestamp: T });
   const KEY = 'huang:123';
+  it('新宽高能修复旧缓存，并保留关联的编码与码率', () => {
+    const result = mergeQualityEntries({ [KEY]: play(1504) }, {
+      [KEY]: { width: 3840, height: 1504, codec: 'H.264', bitrate: 5e6, bitrateKind: 'segment', from: 'probe', timestamp: T },
+    }, T);
+    expect(result[KEY]).toMatchObject({ width: 3840, height: 1504, codec: 'H.264', bitrate: 5e6 });
+    expect(summarizeQuality(Object.values(result)).best).toBe('4K');
+  });
 
   it('播放实测覆盖此前的「测不出」——单码率源的画质只能这样补上', () => {
     // 先探测：单码率 m3u8，没有画质信息（无 error、无 height）
@@ -338,7 +352,9 @@ describe('summarizeQuality', () => {
 
 describe('失败原因标签', () => {
   it('源站拒绝与超时各有短标签', () => {
-    expect(failureReasonLabel('HTTP 403')).toBe('防盗链');
+    expect(failureReasonLabel('HTTP 403')).toBe('访问被拒');
+    expect(failureReasonLabel('The operation was aborted due to timeout')).toBe('超时');
+    expect(isRetryableTimeout('The operation was aborted due to timeout')).toBe(true);
     expect(failureReasonLabel('画质探测超时')).toBe('超时');
     expect(failureReasonLabel('未找到播放资源')).toBe('无资源');
   });

@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-03): accurate media information and source compatibility.
 import { NextResponse } from 'next/server';
 import { guardRequest, jsonError } from '@/lib/api-guard';
 import { checkLiveUrlAllowed, isBlockedByDNS, isValidProxyUrl } from '@/lib/ssrf';
@@ -114,13 +115,21 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
   }
 
   const contentType = response.headers.get('content-type') || '';
+  // 错误页不能按 .m3u8 后缀改写成媒体清单；保留真实错误且不缓存。
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    return NextResponse.json({ error: `点播上游返回 HTTP ${response.status}` }, {
+      status: response.status, headers: { 'Cache-Control': 'no-store' },
+    });
+  }
   const isM3u8 =
     contentType.includes('mpegurl') || contentType.includes('x-mpegurl') ||
-    targetUrl.toLowerCase().endsWith('.m3u8');
+    new URL(finalUrl).pathname.toLowerCase().endsWith('.m3u8');
 
   // m3u8 文本：重写为代理地址（以重定向后的最终 URL 为 base 解析相对地址）
   if (isM3u8) {
     const text = await response.text();
+    if (!text.trimStart().startsWith('#EXTM3U')) return jsonError('上游未返回有效的 HLS 播放列表', 502);
     return new NextResponse(rewriteM3u8(text, finalUrl), {
       status: response.status,
       headers: {

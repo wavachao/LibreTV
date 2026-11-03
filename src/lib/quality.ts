@@ -1,9 +1,10 @@
+// Fork modification by wavachao (2026-11-03): accurate media information and source compatibility.
 /**
- * 画质工具：缓存键、展示标签、高度推断、缓存合并。
+ * 画质工具：缓存键、编码尺寸标签、媒体信息、缓存合并。
  *
  * 画质信息不在 CMS 搜索接口里，只存在于 m3u8 内部（#EXT-X-STREAM-INF 的 RESOLUTION），
  * 因此只能「探测」（拉 m3u8 解析）或「实测」（播放器解码后读 videoHeight）。
- * 本模块只负责这两个来源产出的高度值如何命名与存放，不负责获取。
+ * 本模块负责这些来源产出的宽高与媒体信息如何命名与存放，不负责获取。
  */
 
 import type { QualityEntry } from './types';
@@ -27,8 +28,8 @@ export function failureReasonLabel(error?: string): string | undefined {
   // 传输层失败（请求没送达 / 流中途断）要排在「超时」之前：
   // 这类文案本身就带「多为网关超时」的解释，先匹配超时会把归因指错
   if (/中断|断开|送达|网关拦截/.test(error)) return '连接中断';
-  if (error.includes('超时')) return '超时';
-  if (/HTTP (401|403)/.test(error)) return '防盗链';
+  if (isRetryableTimeout(error)) return '超时';
+  if (/HTTP (401|403)/.test(error)) return '访问被拒';
   // 5xx 多为反代/网关回的错误页，和「源站不给画质」完全不是一回事
   if (/HTTP 5\d\d|\(5\d\d\)/.test(error)) return '网关异常';
   if (error.includes('未找到播放资源')) return '无资源';
@@ -38,7 +39,7 @@ export function failureReasonLabel(error?: string): string | undefined {
 
 /** 超时是唯一值得自动重试的失败：冷启动/CDN 抖动，同一条请求再打一次常能成 */
 export function isRetryableTimeout(error?: string): boolean {
-  return !!error && error.includes('超时');
+  return !!error && /超时|timeout|timed out/i.test(error);
 }
 
 /**
@@ -84,8 +85,15 @@ const TIERS: ReadonlyArray<readonly [number, string]> = [
  * 2160 及以上统称 4K（2K/1440 单独一档，避免 1440 被误标成 1080P）。
  * 偏差超过 15% 的按原样展示（如 144 → 144P、240 → 240P）。
  */
-export function qualityLabel(height?: number): string | undefined {
+export function qualityLabel(height?: number, width?: number): string | undefined {
   if (!height || height <= 0) return undefined;
+  // 裁边电影保留编码长边：3840×1504 属于 4K 尺寸，1920×802 属于 1080P 尺寸。
+  // 竖屏/写反宽高用同一口径；超过电影常见宽高比的超宽画面仍按短边显示。
+  if (width && width > 0) {
+    const long = Math.max(width, height);
+    const short = Math.min(width, height);
+    height = long / short >= 16 / 9 && long / short <= 2.8 ? Math.round(long * 9 / 16) : short;
+  }
   let best: readonly [number, string] | undefined;
   for (const tier of TIERS) {
     const [value] = tier;
@@ -121,9 +129,11 @@ export function mergeQualityEntries(
   for (const [key, value] of Object.entries(incoming)) {
     const prev = next[key];
     if (prev?.from === 'play') {
+      // 旧缓存只有高度，允许新探测补全宽度，修正旧版对裁边电影的误判。
+      if (!prev.width && value.width) { next[key] = value; continue; }
       if (value.from !== 'play') continue;
-      const best = Math.max(prev.height ?? 0, value.height ?? 0);
-      next[key] = { from: 'play', height: best || undefined, timestamp: now };
+      const best = Math.max(value.width ?? 0, value.height ?? 0) >= Math.max(prev.width ?? 0, prev.height ?? 0) ? value : prev;
+      next[key] = { ...best, timestamp: now };
       continue;
     }
     if (prev?.from === 'probe' && value.from === 'probe' && prev.height !== undefined && value.height === undefined) {
@@ -171,15 +181,12 @@ export function describeQualityBadge(
 ): QualityBadgeView | undefined {
   if (loading) return { kind: 'loading', title: '正在探测画质…', retryable: false };
   if (!entry) return undefined;
-  const label = qualityLabel(entry.height);
+  const label = qualityLabel(entry.height, entry.width);
   if (label) {
     return {
       kind: 'value',
       label,
-      title:
-        entry.from === 'play'
-          ? `播放实测的真实分辨率（${entry.height}P）`
-          : `解析播放列表得到的档位（${entry.height}P）`,
+      title: `${entry.from === 'play' ? '播放实测' : '播放列表 / 分片探测'}：${entry.width ? `${entry.width}×${entry.height}` : `${entry.height}P`}。标签表示编码尺寸，不能证明原生画质或 HDR。`,
       retryable: false,
     };
   }
@@ -221,7 +228,7 @@ export interface QualitySummary {
  * 传入 undefined 的条目（尚未探测）不计入 total，避免进度分母虚高。
  */
 export function summarizeQuality(entries: Array<QualityEntry | undefined>): QualitySummary {
-  let bestHeight: number | undefined;
+  let bestEntry: QualityEntry | undefined;
   let known = 0;
   let failed = 0;
   let total = 0;
@@ -230,30 +237,21 @@ export function summarizeQuality(entries: Array<QualityEntry | undefined>): Qual
     total += 1;
     if (entry.height !== undefined && entry.height > 0) {
       known += 1;
-      if (bestHeight === undefined || entry.height > bestHeight) bestHeight = entry.height;
+      if (!bestEntry || Math.max(entry.width ?? 0, entry.height) > Math.max(bestEntry.width ?? 0, bestEntry.height ?? 0)) bestEntry = entry;
     } else if (entry.error) {
       failed += 1;
     }
   }
-  return { best: qualityLabel(bestHeight), known, failed, total };
+  return { best: qualityLabel(bestEntry?.height, bestEntry?.width), known, failed, total };
 }
 
-/**
- * 码率 → 推断高度：部分源站的 master playlist 只给 BANDWIDTH 不给 RESOLUTION。
- * 分层取自常见转码参数，仅供档位标识使用（与 m3u8-parse 的推断表保持一致）。
- */
-export function inferHeightFromBitrate(bandwidth: number): number {
-  const tiers: Array<[number, number]> = [
-    [20_000_000, 4320],
-    [10_000_000, 2160],
-    [5_000_000, 1080],
-    [3_000_000, 720],
-    [1_500_000, 540],
-    [800_000, 480],
-    [400_000, 360],
-  ];
-  for (const [bps, height] of tiers) {
-    if (bandwidth >= bps) return height;
-  }
-  return 240;
+/** 可直接展示的媒体信息；缺失字段保持未知，禁止由码率猜测分辨率或 HDR。 */
+export function streamQualityText(info: import('./types').StreamQuality): string {
+  return [
+    info.width && info.height ? `${info.width}×${info.height}` : info.height ? `${info.height}P` : undefined,
+    info.codec?.replace(/avc[13]\.[\da-f]+/gi, 'H.264').replace(/(?:hev1|hvc1)(?:\.[\w.]+)?/gi, 'H.265'),
+    info.frameRate ? `${Number(info.frameRate.toFixed(2))} fps` : undefined,
+    info.videoRange,
+    info.bitrate ? `${info.bitrateKind === 'segment' ? '分片采样约' : '清单声明'} ${(info.bitrate / 1e6).toFixed(2)} Mbps` : undefined,
+  ].filter(Boolean).join(' · ');
 }

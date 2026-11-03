@@ -1,4 +1,4 @@
-// Fork modification by wavachao (2026-11-02): accessible speed and episode menus inside the player.
+// Fork modification by wavachao (2026-11-03): accessible speed and episode menus inside the player.
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
@@ -7,6 +7,7 @@ import Artplayer from 'artplayer';
 import Hls, { type HlsConfig } from 'hls.js';
 import { Icon } from './icon';
 import { useFocusTrap } from './use-focus-trap';
+import type { StreamQuality } from '@/lib/types';
 
 import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
 import { createHlsLoader } from '@/lib/hls-loader';
@@ -97,7 +98,7 @@ interface PlayerShellProps {
    * 单码率 m3u8 / 直链的分辨率只能等解码后才知道，播放一次后回写缓存，
    * 下次搜索同一部剧就能直接显示画质，不必再探测。
    */
-  onQuality?: (height: number) => void;
+  onQuality?: (quality: StreamQuality) => void;
   /** 恢复策略判源不可用（重试耗尽/格式硬失败）时回调：父级弹出换源面板 */
   onRequestSwitchSource?: (reason: string) => void;
   /** 控制条上的上一集 / 下一集：不在播放器里也能切集，省得回到页面按钮 */
@@ -155,7 +156,7 @@ export function PlayerShell({
     document.addEventListener('keydown', close);
     return () => document.removeEventListener('keydown', close);
   }, [menu]);
-  // 起播占位仅在视频真正开始播放后隐藏。
+  // 媒体就绪后移除起播占位，自动播放被阻止时仍可看到画面和播放按钮。
   const [showPoster, setShowPoster] = useState(true);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -176,8 +177,10 @@ export function PlayerShell({
   };
 
   /** 上报实测画质：多次上报取大值由调用方决定，这里只管把拿到的高度传出去 */
-  const reportQuality = (height: number) => {
-    if (height > 0) propsRef.current.onQuality?.(height);
+  const streamInfoRef = useRef<StreamQuality>({});
+  const reportQuality = (quality: StreamQuality) => {
+    streamInfoRef.current = { ...streamInfoRef.current, ...quality };
+    propsRef.current.onQuality?.(streamInfoRef.current);
   };
 
   // 跨集共享、每次换集重置的播放链路状态
@@ -426,21 +429,28 @@ export function PlayerShell({
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       recoveryRef.current?.markHealthy();
-      // master playlist 的档位高度：多码率源在这里就能拿到上限
-      const heights = hls.levels
-        .map((level) => level.height)
-        .filter((h): h is number => typeof h === 'number' && h > 0);
-      if (heights.length > 0) reportQuality(Math.max(...heights));
       // 进度恢复改由 restoreAndStart 处理：duration 未就绪时不消费标记，挂事件重试
       void restoreAndStart();
     });
     // 播放链路恢复（FRAG_LOADED / MANIFEST_PARSED）：静默窗外清零连续失败计数
-    hls.on(Hls.Events.FRAG_LOADED, () => recoveryRef.current?.markHealthy());
-    // 单码率源在 MANIFEST 阶段拿不到 height（清单尚未解析），这里补一次。
-    // 注意 data.level 是档位下标，分辨率在 levelInfo 上
-    hls.on(Hls.Events.LEVEL_LOADED, (_evt, data) => {
-      const height = data.levelInfo?.height;
-      if (typeof height === 'number') reportQuality(height);
+    const samples: { bytes: number; seconds: number }[] = [];
+    hls.on(Hls.Events.FRAG_LOADED, (_evt, data) => {
+      recoveryRef.current?.markHealthy();
+      if (data.frag.type !== 'main' || data.frag.sn === 'initSegment' || !(data.frag.duration > 0)) return;
+      // 最近 12 个实际下载分片的封装字节 / 媒体时长。吞吐率不能当作码率。
+      samples.push({ bytes: data.payload.byteLength, seconds: data.frag.duration });
+      if (samples.length > 12) samples.shift();
+      const level = hls.levels[data.frag.level];
+      reportQuality({
+        bitrate: samples.reduce((n, s) => n + s.bytes * 8, 0) / samples.reduce((n, s) => n + s.seconds, 0),
+        bitrateKind: 'segment',
+        ...(level?.attrs['FRAME-RATE'] ? { frameRate: Number(level.attrs['FRAME-RATE']) } : {}),
+        ...(level?.attrs['VIDEO-RANGE'] ? { videoRange: level.attrs['VIDEO-RANGE'] } : {}),
+      });
+    });
+    hls.on(Hls.Events.BUFFER_CODECS, (_evt, data) => {
+      const codec = data.video?.codec;
+      if (codec) reportQuality({ codec });
     });
     // 分片真正进入 MSE buffer 才算媒体恢复：此时视频轨可渲染，错误态可解除
     hls.on(Hls.Events.FRAG_BUFFERED, () => {
@@ -496,6 +506,7 @@ export function PlayerShell({
   /** 换集：重置每集状态并切换到新 HLS 源（不重建 ArtPlayer）。 */
   const loadEpisode = (targetUrl: string) => {
     if (!targetUrl) return;
+    streamInfoRef.current = {};
     mediaHealthyRef.current = true;
     playbackStartedRef.current = false;
     videoErrorRetryUsedRef.current = false;
@@ -682,10 +693,11 @@ export function PlayerShell({
      */
     const reportVideoHeight = () => {
       const height = art.video?.videoHeight;
-      if (typeof height === 'number' && height > 0) reportQuality(height);
+      const width = art.video?.videoWidth;
+      if (height > 0 && width > 0) reportQuality({ width, height });
     };
     art.on('video:loadedmetadata', reportVideoHeight);
-    art.on('video:canplay', reportVideoHeight);
+    art.on('video:canplay', () => { reportVideoHeight(); setShowPoster(false); });
     // resize 不在 ArtPlayer 的视频事件转发表里，直接挂原生事件
     art.video?.addEventListener('resize', reportVideoHeight);
 

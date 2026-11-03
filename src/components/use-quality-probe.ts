@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-03): accurate media information and source compatibility.
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -42,6 +43,7 @@ function getSharedQueue(): ProbeQueue {
 }
 
 const toEntry = (result: QualityProbeResult): QualityEntry => ({
+  ...result,
   height: result.height,
   from: 'probe',
   error: result.error,
@@ -188,7 +190,7 @@ export function useQualityProbe(sources?: SourceConfig[]) {
         if (force) return true;
         const known = cached[key] ?? qualitiesRef.current[key];
         // 已有结论（含「测不出」）是终态，重探还是同一个结果
-        if (known && !known.error) return false;
+        if (known && !known.error && (!known.height || known.width)) return false;
         const last = settledRef.current.get(key);
         return last === undefined || now - last > QUALITY_FAIL_TTL_MS;
       });
@@ -291,7 +293,7 @@ export function useQualityProbe(sources?: SourceConfig[]) {
         const key = qualityKey(target.sourceKey, target.vodId);
         if (inflightRef.current.has(key)) return false;
         const known = cached[key];
-        if (known && !known.error) return false;
+        if (known && !known.error && (!known.height || known.width)) return false;
         const last = settledRef.current.get(key);
         return last === undefined || now - last > QUALITY_FAIL_TTL_MS;
       });

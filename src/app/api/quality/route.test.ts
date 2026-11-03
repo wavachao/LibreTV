@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-03): verify metadata survives fresh, cached and streamed results.
 /**
  * 批量画质探测接口单测：同 URL + detail + 影片的并发请求要合并成一次上游探测，
  * 但结果仍按各自条目的 sourceKey 返回（直接按 cacheKey 去重会把另一个源的徽章吞掉）。
@@ -36,7 +37,7 @@ vi.mock('@/lib/quality-probe', () => ({
   probeQuality: vi.fn(async () => {
     state.calls++;
     if (state.abort) throw new DOMException('aborted', 'AbortError');
-    return { sourceKey: 'mock', vodId: 'mock', height: 1080 };
+    return { sourceKey: 'mock', vodId: 'mock', width: 1920, height: 1080, codec: 'H.264' };
   }),
 }));
 
@@ -67,7 +68,7 @@ describe('POST /api/quality', () => {
     expect(state.calls).toBe(1);
     expect(data.results).toHaveLength(2);
     expect(data.results.map((r) => r.sourceKey).sort()).toEqual(['a', 'b']);
-    expect(data.results.every((r) => r.height === 1080)).toBe(true);
+    expect(data.results.every((r) => r.height === 1080 && r.width === 1920 && r.codec === 'H.264')).toBe(true);
   });
 
   it('探测完成后才写缓存；并发请求缓存未命中时也只会打一次源站', async () => {
@@ -81,9 +82,11 @@ describe('POST /api/quality', () => {
   });
 
   it('第二次同 key 请求命中缓存：不再调 probeQuality', async () => {
-    await POST(post([item('a', 'https://s.test/api')]));
+    const res = await POST(post([item('b', 'https://s.test/api')]));
+    expect((await res.json()).results[0]).toMatchObject({ sourceKey: 'b', vodId: '1', width: 1920, codec: 'H.264' });
     expect(state.calls).toBe(1);
-    await POST(post([item('a', 'https://s.test/api')]));
+    const cached = await POST(post([item('a', 'https://s.test/api')]));
+    expect((await cached.json()).results[0]).toMatchObject({ sourceKey: 'a', vodId: '1', width: 1920, codec: 'H.264' });
     expect(state.calls).toBe(1);
   });
 
@@ -113,6 +116,6 @@ describe('POST /api/quality', () => {
       .split('\n')
       .map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(lines[0]).toEqual({ ping: true });
-    expect(lines[1]).toMatchObject({ sourceKey: 'a', height: 1080 });
+    expect(lines[1]).toMatchObject({ sourceKey: 'a', width: 1920, height: 1080, codec: 'H.264' });
   });
 });

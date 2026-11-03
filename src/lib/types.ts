@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-03): accurate media information and source compatibility.
 // 采集站（Apple CMS 资源站）描述
 export interface SourceConfig {
   /** 唯一标识，如 "custom_0"；内置源直接用短名 */
@@ -42,6 +43,8 @@ export interface VideoInfo {
 
 export interface VideoDetail {
   episodes: string[];
+  /** 仅保留可直接播放的媒体线路；网页中转地址不交给播放器。 */
+  playLines?: { name: string; episodes: string[] }[];
   videoInfo: VideoInfo;
 }
 
@@ -69,10 +72,20 @@ export interface SourceSearchOutcome {
 /**
  * 画质记录条目。
  * `height` 为视频高度（像素），undefined 表示探测过但测不出（单码率 m3u8 / 直链）。
- * `from` 区分来源：play 是播放器实测的真实分辨率（权威），probe 是解析 m3u8 推断值。
+ * `from` 区分来源：play 是播放器实测的真实分辨率（权威），probe 是解析播放列表或分片头获得的信息。
  */
-export interface QualityEntry {
+export interface StreamQuality {
+  width?: number;
   height?: number;
+  codec?: string;
+  frameRate?: number;
+  videoRange?: string;
+  /** 分片封装码率，bps；不是下载速度，也不是整片平均视频码率。 */
+  bitrate?: number;
+  bitrateKind?: 'declared' | 'segment';
+}
+
+export interface QualityEntry extends StreamQuality {
   from: 'play' | 'probe';
   /**
    * 探测失败原因（如 `HTTP 403`、`请求超时`）。
@@ -91,7 +104,7 @@ export interface QualityProbeItem {
 }
 
 /** 画质探测结果；height 缺失代表「测不出」而非失败失败（error 有值时才是失败） */
-export interface QualityProbeResult {
+export interface QualityProbeResult extends StreamQuality {
   sourceKey: string;
   vodId: string;
   height?: number;

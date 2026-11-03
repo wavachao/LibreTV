@@ -1,3 +1,4 @@
+// Fork modification by wavachao (2026-11-03): accurate media information and source compatibility.
 import type { SearchResultItem, VideoDetail } from './types';
 
 /**
@@ -49,24 +50,20 @@ export function parseSearchList(
 /**
  * 从 vod_play_url 中提取分集地址：格式 源1$$$源2，集1$URL1#集2$URL2。
  * 部分源（如量子 lziapi、非凡 ffzy）第一条线路是网页中转页（…/share/xxx，不可播），
- * 真实 m3u8 在后面的线路里，因此优先取包含 m3u8 直链的线路；均无 m3u8 时回退第一条。
+ * 真实 m3u8 在后面的线路里，因此优先取 HLS，其次 MP4；网页中转地址不交给播放器。
  */
 export function extractEpisodesFromPlayUrl(playUrl: string): string[] {
-  if (!playUrl) return [];
-  const groups = playUrl
-    .split('$$$')
-    .map((group) =>
-      group
-        .split('#')
-        .map((ep) => {
-          const parts = ep.split('$');
-          return parts.length > 1 ? parts[1] : '';
-        })
-        .filter((url) => url.startsWith('http://') || url.startsWith('https://'))
-    )
-    .filter((eps) => eps.length > 0);
-  if (groups.length === 0) return [];
-  return groups.find((eps) => eps.some((url) => url.includes('.m3u8'))) ?? groups[0];
+  return extractPlayLines(playUrl)[0]?.episodes ?? [];
+}
+
+export function extractPlayLines(playUrl: string, playFrom = ''): NonNullable<VideoDetail['playLines']> {
+  const names = playFrom.split('$$$');
+  return playUrl.split('$$$').map((group, i) => ({
+    name: names[i]?.trim() || `线路 ${i + 1}`,
+    episodes: group.split('#').map((ep) => ep.slice(ep.indexOf('$') + 1).trim())
+      .filter((url) => /^https?:\/\//i.test(url) && /\.(m3u8|mp4)(?:[?#]|$)/i.test(url)),
+  })).filter((line) => line.episodes.length > 0)
+    .sort((a, b) => Number(b.episodes.some((url) => /\.m3u8(?:[?#]|$)/i.test(url))) - Number(a.episodes.some((url) => /\.m3u8(?:[?#]|$)/i.test(url))));
 }
 
 /** 从简介文本中兜底提取 m3u8 链接 */
@@ -86,12 +83,14 @@ export function parseDetail(
     throw new Error('获取到的详情内容无效');
   }
   const vod = d.list[0];
-  let episodes = extractEpisodesFromPlayUrl(String(vod.vod_play_url ?? ''));
+  const playLines = extractPlayLines(String(vod.vod_play_url ?? ''), String(vod.vod_play_from ?? ''));
+  let episodes = playLines[0]?.episodes ?? [];
   if (episodes.length === 0) {
     episodes = extractM3u8FromText(String(vod.vod_content ?? ''));
   }
   return {
     episodes,
+    playLines,
     videoInfo: {
       title: str(vod.vod_name),
       cover: str(vod.vod_pic),

@@ -1,6 +1,8 @@
+// Fork modification by wavachao (2026-11-03): preserve playable source groups.
 import { describe, expect, it } from 'vitest';
 import {
   extractEpisodesFromPlayUrl,
+  extractPlayLines,
   extractM3u8FromText,
   filterAdultResults,
   filterRelevantResults,
@@ -47,6 +49,13 @@ describe('parseSearchList', () => {
 });
 
 describe('extractEpisodesFromPlayUrl', () => {
+  it('保留所有媒体线路和名称，网页中转地址不进入播放器', () => {
+    expect(extractPlayLines('正片$https://cdn/share/1$$$HD$https://cdn/hd.m3u8?sign=x$$$UHD$https://cdn/uhd.m3u8', '网页$$$高清$$$超清')).toEqual([
+      { name: '高清', episodes: ['https://cdn/hd.m3u8?sign=x'] },
+      { name: '超清', episodes: ['https://cdn/uhd.m3u8'] },
+    ]);
+    expect(extractEpisodesFromPlayUrl('正片$https://cdn/share/1')).toEqual([]);
+  });
   it('解析 源$$$源 与 集$URL#集$URL 结构', () => {
     const play = '第01集$https://cdn/a1.m3u8#第02集$https://cdn/a2.m3u8$$$备用$https://x/b.m3u8';
     expect(extractEpisodesFromPlayUrl(play)).toEqual([
