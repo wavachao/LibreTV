@@ -318,7 +318,10 @@ function WatchContent() {
                 // 这里先提示的话，用户随后取消保存位置会出现「已加入→已取消」的矛盾
               }}
             >
-              <Icon name="download" className="w-4 h-4" />下载本集
+              {/* 窄顶栏放不下完整文案：小屏只留图标 */}
+              <Icon name="download" className="w-4 h-4" />
+              <span className="hidden sm:inline">下载本集</span>
+              <span className="sr-only sm:hidden">下载本集</span>
             </button>
           </div>
         </div>
@@ -340,6 +343,8 @@ function WatchContent() {
                   autoplayNext={store.autoplayNext}
                   skipMark={skipMark}
                   autoSkipSegments={store.autoSkipSegments}
+                  volumeBoost={store.volumeBoost}
+                  miniProgressBar={store.miniProgressBar}
                   pendingStart={pendingStart}
                   onPendingStart={setPendingStart}
                   onPlayerApi={(api) => { playerApiRef.current = api; }}
