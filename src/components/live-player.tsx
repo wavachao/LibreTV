@@ -5,6 +5,7 @@ import Artplayer from 'artplayer';
 import Hls, { type HlsConfig } from 'hls.js';
 import { Spinner } from './states';
 import { prefersTouchPointer } from '@/lib/touch-pointer';
+import { attachMobileFullscreen, attachTouchControlHide } from '@/lib/mobile-fullscreen';
 import { ART_DEFAULT_CONTROL_HIDE_MS, TOUCH_CONTROL_HIDE_MS } from '@/lib/control-hide';
 
 /**
@@ -292,8 +293,8 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel }: LivePla
         click: () => onNextChannel(),
       });
     }
-    // 触屏没有 hover，原生 3 秒自动隐藏会让直播控制栏（上一台/下一台）点不到
-    // （issue #937）：触屏常驻、由点按视频 toggle 收起；桌面行为不变
+    // 触屏不走 ArtPlayer 自带隐藏计时（issue #937，合成 mousemove 会把控制栏翻掉）。
+    // 点按后再由 attachTouchControlHide 收起；桌面仍用播放器默认计时。
     const touchPointer = prefersTouchPointer();
     if (touchPointer) Artplayer.CONTROL_HIDE_TIME = TOUCH_CONTROL_HIDE_MS;
 
@@ -311,7 +312,7 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel }: LivePla
       playbackRate: false,
       aspectRatio: false,
       fullscreen: true,
-      fullscreenWeb: true,
+      fullscreenWeb: !touchPointer,
       miniProgressBar: false,
       hotkey: false,
       mutex: true,
@@ -335,6 +336,8 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel }: LivePla
       },
     });
     artRef.current = art;
+    const mobileFullscreen = touchPointer ? attachMobileFullscreen(art.template.$player) : null;
+    const releaseTouchControls = touchPointer ? attachTouchControlHide(art) : null;
     art.on('video:loadedmetadata', () => {
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -371,6 +374,8 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel }: LivePla
       clearTimeout(startTimer);
       if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
       cleanupEngines();
+      mobileFullscreen?.dispose();
+      releaseTouchControls?.();
       art.destroy();
       artRef.current = null;
       // CONTROL_HIDE_TIME 是全局 static：恢复库默认值，避免影响后续挂载的其它播放器

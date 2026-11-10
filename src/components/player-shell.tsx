@@ -18,6 +18,7 @@ import {
 import { loadCacheSettings } from '@/lib/video-cache';
 import { formatTime } from '@/lib/utils';
 import { prefersTouchPointer } from '@/lib/touch-pointer';
+import { attachMobileFullscreen, attachTouchControlHide } from '@/lib/mobile-fullscreen';
 import {
   findActiveSegment,
   findCrossedEnding,
@@ -533,9 +534,8 @@ export function PlayerShell({
   useEffect(() => {
     if (!containerRef.current || !propsRef.current.url) return;
     const initialUrl = propsRef.current.url;
-    // ArtPlayer 默认 3 秒才隐藏控制栏；桌面失去鼠标悬停后缩短为 0.8 秒。
-    // 触屏没有 hover，自动隐藏会让按钮来不及点（issue #937）：改为常驻，
-    // 由「点按视频 toggle」收起。CONTROL_HIDE_TIME 是 static，创建后修改立即生效。
+    // 触屏不走 ArtPlayer 自带隐藏计时：合成 mousemove 会把控制栏瞬间翻掉（issue #937）。
+    // static 保持不自动隐藏，点按后再由 attachTouchControlHide 收起。
     const touchPointer = prefersTouchPointer();
     Artplayer.CONTROL_HIDE_TIME = touchPointer ? TOUCH_CONTROL_HIDE_MS : DESKTOP_CONTROL_HIDE_MS;
 
@@ -575,13 +575,13 @@ export function PlayerShell({
       volume: 0.8,
       autoplay: true,
       pip: true,
-      autoMini: true,
+      autoMini: !touchPointer,
       screenshot: true,
       setting: true,
       playbackRate: true,
       aspectRatio: true,
       fullscreen: true,
-      fullscreenWeb: true,
+      fullscreenWeb: !touchPointer,
       miniProgressBar: true,
       mutex: true,
       backdrop: true,
@@ -625,6 +625,8 @@ export function PlayerShell({
     artRef.current = art;
     art.template.$player.classList.add('watch-artplayer');
     setOverlayHost(art.template.$player);
+    const mobileFullscreen = touchPointer ? attachMobileFullscreen(art.template.$player) : null;
+    const releaseTouchControls = touchPointer ? attachTouchControlHide(art) : null;
 
     // 进度条区间可视化：初始渲染一次，换集 duration 变化时重绘
     renderSkipMarks();
@@ -853,7 +855,9 @@ export function PlayerShell({
           current.toggle(); showHint('播放/暂停'); e.preventDefault();
           break;
         case 'f': case 'F':
-          current.fullscreen = !current.fullscreen; e.preventDefault();
+          if (mobileFullscreen) mobileFullscreen.toggle();
+          else current.fullscreen = !current.fullscreen;
+          e.preventDefault();
           break;
         // 标记类快捷键一律要求 Shift：这几键会直接写盘并影响整部剧，
         // 单键太容易误触（误记片头 = 之后每集都被跳过一大段）
@@ -995,6 +999,8 @@ export function PlayerShell({
       restoreCleanupRef.current?.();
       restoreCleanupRef.current = null;
       Artplayer.CONTROL_HIDE_TIME = ART_DEFAULT_CONTROL_HIDE_MS;
+      mobileFullscreen?.dispose();
+      releaseTouchControls?.();
       hlsRef.current?.destroy();
       hlsRef.current = null;
       recoveryRef.current?.dispose();

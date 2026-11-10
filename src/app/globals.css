@@ -318,3 +318,55 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .watch-page *, .watch-player-menu *, .watch-player-title { transition: none !important; }
 }
+
+/* 触屏没有网页全屏。横屏后视口变宽也不要把这个按钮放回来。 */
+@media (hover: none) and (pointer: coarse) {
+  .art-control-fullscreenWeb { display: none !important; }
+}
+
+/* 手机全屏：系统横屏锁定成功时补上刘海安全区。 */
+.art-video-player.is-mobile-fullscreen:not(.needs-rotate) .art-bottom {
+  padding-left: max(12px, env(safe-area-inset-left));
+  padding-right: max(12px, env(safe-area-inset-right));
+  padding-bottom: max(8px, env(safe-area-inset-bottom));
+}
+
+/* lock() 不可用时的竖屏全屏：把播放器转 90°。转到横屏后这条媒体查询失效，避免转两次。 */
+.art-video-player.pseudo-fullscreen {
+  position: fixed !important;
+  z-index: 100;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  margin: 0;
+  background: #000;
+}
+html.mobile-fs-lock,
+html.mobile-fs-lock body { overflow: hidden; }
+@media (orientation: portrait) {
+  .art-video-player.pseudo-fullscreen.needs-rotate {
+    width: 100vh;
+    width: 100dvh;
+    height: 100vw;
+    top: 0;
+    left: 100vw;
+    transform: rotate(90deg);
+    transform-origin: top left;
+  }
+  .art-video-player.needs-rotate:fullscreen,
+  .art-video-player.needs-rotate:-webkit-full-screen {
+    width: 100vh !important;
+    width: 100dvh !important;
+    height: 100vw !important;
+    max-width: none !important;
+    max-height: none !important;
+    top: 0 !important;
+    left: 100vw !important;
+    right: auto !important;
+    bottom: auto !important;
+    transform: rotate(90deg) !important;
+    transform-origin: top left !important;
+  }
+}
