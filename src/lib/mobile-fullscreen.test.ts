@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { lockLandscape, unlockLandscape } from './mobile-fullscreen';
+import { lockLandscape, stageBox, unlockLandscape } from './mobile-fullscreen';
 
 describe('lockLandscape', () => {
   it('锁定 landscape，左右两个横屏方向都允许', async () => {
@@ -16,6 +16,28 @@ describe('lockLandscape', () => {
   it('没有 orientation.lock（旧浏览器 / iOS）返回 false', async () => {
     await expect(lockLandscape(undefined)).resolves.toBe(false);
     await expect(lockLandscape({ orientation: {} })).resolves.toBe(false);
+  });
+});
+
+describe('stageBox', () => {
+  it('竖屏全屏时，内层转 90° 后盖住 390×844', () => {
+    expect(stageBox(390, 844, false)).toEqual({
+      left: 390,
+      top: 0,
+      width: 844,
+      height: 390,
+      transform: 'rotate(90deg)',
+    });
+  });
+
+  it('系统已经转成横屏时，内层只铺满，不再旋转', () => {
+    expect(stageBox(844, 390, true)).toEqual({
+      left: 0,
+      top: 0,
+      width: 844,
+      height: 390,
+      transform: 'none',
+    });
   });
 });
 
