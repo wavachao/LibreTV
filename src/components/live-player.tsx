@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import Artplayer from 'artplayer';
 import Hls, { type HlsConfig } from 'hls.js';
 import { Spinner } from './states';
@@ -8,6 +9,8 @@ import { prefersTouchPointer } from '@/lib/touch-pointer';
 import { attachMobileFullscreen, attachTouchControlHide } from '@/lib/mobile-fullscreen';
 import { ART_DEFAULT_CONTROL_HIDE_MS, TOUCH_CONTROL_HIDE_MS } from '@/lib/control-hide';
 import { attachVolumeBoost, type VolumeBoostHandle } from '@/lib/volume-boost';
+import { attachMobilePlayer, type GestureHud } from '@/lib/mobile-player';
+import { GestureChrome } from './gesture-chrome';
 
 /**
  * 直播播放器：与点播 player-shell 完全独立。
@@ -77,6 +80,14 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel, volumeBoo
   // 创建实例的 effect 不依赖 volumeBoost（换台才重建），起播回调靠这个 ref 读最新设置
   const volumeBoostSettingRef = useRef(volumeBoost);
   volumeBoostSettingRef.current = volumeBoost;
+  const [overlayHost, setOverlayHost] = useState<HTMLElement | null>(null);
+  const [touchUi, setTouchUi] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const lockedRef = useRef(false);
+  const [gestureHud, setGestureHud] = useState<GestureHud | null>(null);
+  const hudSetter = useRef<(hud: GestureHud | null) => void>(() => {});
+  hudSetter.current = setGestureHud;
+  useEffect(() => { setTouchUi(prefersTouchPointer()); }, []);
 
   // url 变化即换台：显示频道名 2.5s
   useEffect(() => {
@@ -346,6 +357,15 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel, volumeBoo
     artRef.current = art;
     const mobileFullscreen = touchPointer ? attachMobileFullscreen(art.template.$player) : null;
     const releaseTouchControls = touchPointer ? attachTouchControlHide(art) : null;
+    const releaseGestures = attachMobilePlayer(art.template.$player, {
+      getVideo: () => art.video,
+      allowSeek: false,
+      allowRateBoost: false,
+      getLocked: () => lockedRef.current,
+      onHud: (hud) => hudSetter.current(hud),
+    });
+    if (lockedRef.current) art.template.$player.classList.add('is-gesture-locked');
+    setOverlayHost(art.template.$player);
     art.on('video:loadedmetadata', () => {
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -389,6 +409,8 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel, volumeBoo
       cleanupEngines();
       mobileFullscreen?.dispose();
       releaseTouchControls?.();
+      releaseGestures();
+      setOverlayHost(null);
       volumeBoostRef.current?.dispose();
       volumeBoostRef.current = null;
       art.destroy();
@@ -413,6 +435,17 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel, volumeBoo
       volumeBoostRef.current?.setBoost(false);
     }
   }, [volumeBoost]);
+
+  const toggleLock = () => {
+    const next = !lockedRef.current;
+    lockedRef.current = next;
+    setLocked(next);
+    const root = artRef.current?.template?.$player as HTMLElement | undefined;
+    root?.classList.toggle('is-gesture-locked', next);
+    if (next) {
+      try { artRef.current.controls.show = false; } catch { /* 忽略 */ }
+    }
+  };
 
   return (
     <div className="relative w-full h-full">
@@ -467,6 +500,16 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel, volumeBoo
         <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black/70 text-white text-sm px-3 py-1.5 rounded-full pointer-events-none animate-fade-in">
           {hint}
         </div>
+      )}
+      {overlayHost && createPortal(
+        <GestureChrome
+          active={touchUi}
+          hud={gestureHud}
+          locked={locked}
+          coach="左侧上下滑调亮度，右侧上下滑调音量。直播进度由信号决定，不能快进。"
+          onToggleLock={toggleLock}
+        />,
+        overlayHost,
       )}
     </div>
   );

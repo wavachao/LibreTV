@@ -23,6 +23,7 @@ import { useAuth } from '@/components/auth';
 import { allLiveSources, useAppStore } from '@/lib/store';
 import { cn } from '@/lib/utils';
 import { SmartImage } from '@/components/smart-image';
+import { PotPlayerButton } from '@/components/potplayer-button';
 
 /**
  * 直播页：左侧播放器 + 频道信息 + 节目单；右侧频道侧栏。
@@ -357,6 +358,7 @@ function LiveContent() {
                       />
                     </svg>
                   </button>
+                  <PotPlayerButton url={currentChannel.url} title={currentChannel.name} variant="icon" />
                   <button
                     className="rounded-md p-2 text-muted hover:text-accent hover:bg-hover transition-colors"
                     aria-label="复制播放地址"

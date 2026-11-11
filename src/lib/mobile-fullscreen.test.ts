@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { lockLandscape, stageBox, unlockLandscape } from './mobile-fullscreen';
+import { effectiveLandscapeLock, fullscreenLossAction, lockLandscape, stageBox, unlockLandscape } from './mobile-fullscreen';
 
 describe('lockLandscape', () => {
   it('锁定 landscape，左右两个横屏方向都允许', async () => {
@@ -38,6 +38,27 @@ describe('stageBox', () => {
       height: 390,
       transform: 'none',
     });
+  });
+});
+
+describe('effectiveLandscapeLock', () => {
+  it('视口已经横屏时，方向锁仍然有效，不再 CSS 旋转', () => {
+    expect(effectiveLandscapeLock(844, 390, true)).toBe(true);
+  });
+
+  it('锁屏把方向锁解开、屏幕回到竖屏时，不能再相信旧的锁定标记', () => {
+    expect(effectiveLandscapeLock(390, 844, true)).toBe(false);
+    expect(stageBox(390, 844, effectiveLandscapeLock(390, 844, true)).transform).toBe('rotate(90deg)');
+  });
+});
+
+describe('fullscreenLossAction', () => {
+  it('页面被锁屏藏起来时保留全屏，回到前台再锁横屏', () => {
+    expect(fullscreenLossAction('hidden')).toBe('keep');
+  });
+
+  it('页面还看得见时退出全屏，才是用户要离开', () => {
+    expect(fullscreenLossAction('visible')).toBe('exit');
   });
 });
 

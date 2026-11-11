@@ -23,6 +23,7 @@ import { skipMarkKey, validateSegment, type SkipSegment } from '@/lib/skip-marks
 import type { PlayerSkipApi } from '@/components/player-shell';
 import { useToast } from '@/components/toast';
 import { enqueueDownload } from '@/components/download-manager';
+import { PotPlayerButton } from '@/components/potplayer-button';
 import { Icon } from '@/components/icon';
 import { SmartImage } from '@/components/smart-image';
 import { useAuth } from '@/components/auth';
@@ -392,6 +393,16 @@ function WatchContent() {
               >
                 <Icon name="screen" className="w-4 h-4" />{cinema ? '退出影院' : '影院模式'}
               </button>
+              {currentUrl && (
+                <PotPlayerButton
+                  url={currentUrl}
+                  title={videoTitle}
+                  playlist={episodes.map((episodeUrl, index) => ({
+                    url: episodeUrl,
+                    title: episodes.length > 1 ? `${videoTitle} 第${index + 1}集` : videoTitle,
+                  }))}
+                />
+              )}
               <button
                 className="watch-action"
                 disabled={currentIndex <= 0}

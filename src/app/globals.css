@@ -187,10 +187,9 @@ body {
 }
 
 /*
- * 播放器控制条在窄屏没有多余横向空间：
- * 上/下集控件会把右侧的「网页全屏」「全屏」挤出可视区（手机上表现为图标显示不全）。
- * 只在窄于 640px 时收起这两个控件——手机横屏、平板仍有空间，可以保留。
- * 切集在任何情况下都还能用播放器下方的按钮。
+ * 小窗播放器在窄屏没有多余横向空间：上/下集会把右侧的全屏按钮挤出去。
+ * 只在未全屏、且视口窄于 640px 时收起。全屏后页面下方的切集按钮被挡住，
+ * 控制栏里必须留下上一集、下一集。
  */
 @media (max-width: 640px) {
   /* 竖屏空间只够放「播放 + 时间 + 设置 + 网页全屏 + 全屏」：
@@ -205,6 +204,15 @@ body {
   }
 
   /* 00:04 / 01:26:30 这种长文本占宽最多，缩字号再收紧内边距 */
+  .art-video-player.art-fullscreen .art-control-prev-episode,
+  .art-video-player.art-fullscreen .art-control-next-episode,
+  .art-video-player.art-fullscreen-web .art-control-prev-episode,
+  .art-video-player.art-fullscreen-web .art-control-next-episode,
+  .art-video-player.is-mobile-fullscreen .art-control-prev-episode,
+  .art-video-player.is-mobile-fullscreen .art-control-next-episode {
+    display: flex !important;
+  }
+
   .art-control-time {
     font-size: 11px;
     padding: 0 2px;
@@ -284,11 +292,17 @@ body {
 .watch-cinema .watch-episodes { grid-template-columns: repeat(auto-fill, minmax(54px, 1fr)); }
 
 /* 控制条与全屏面板。禁用对其它 ArtPlayer（例如直播）的样式污染。 */
-.watch-artplayer { --art-control-height: 48px; --art-control-icon-size: 22px; --art-control-icon-scale: 1; --art-bottom-gap: 12px; --art-progress-height: 4px; font-family: inherit; }
+.watch-artplayer { --art-control-height: 48px; --art-control-icon-size: 22px; --art-control-icon-scale: 1; --art-bottom-gap: 14px; --art-progress-height: 4px; font-family: inherit; }
+/* 库的样式表后注入，同权重会把圆点缩放盖回 0。这里用两个类压过它，手指才抓得住。 */
+.art-video-player.watch-artplayer { --art-progress-top-gap: 20px; --art-indicator-scale: 1; --art-indicator-size: 16px; }
+.watch-artplayer .art-progress { touch-action: none; }
+.art-video-player.watch-artplayer.art-fullscreen,
+.art-video-player.watch-artplayer.art-fullscreen-web,
+.art-video-player.watch-artplayer.is-mobile-fullscreen { --art-progress-height: 6px; --art-indicator-size: 18px; --art-progress-top-gap: 24px; }
 .watch-artplayer .art-bottom { padding: 0 18px 6px; background: linear-gradient(transparent, rgb(0 0 0 / .85)); }
 .watch-artplayer .art-controls-right { gap: 2px; }
 .watch-artplayer .art-controls-right .art-control { width: 38px; }
-.watch-artplayer .art-controls-right .art-control-quick-speed, .watch-artplayer .art-controls-right .art-control-episode-menu { width: auto; min-width: 46px; }
+.watch-artplayer .art-controls-right .art-control-quick-speed, .watch-artplayer .art-controls-right .art-control-episode-menu, .watch-artplayer .art-controls-right .art-control-tools { width: auto; min-width: 46px; }
 .watch-control-label { padding: 8px; font-size: 13px; color: #f8fafc; font-family: inherit; border-radius: 5px; }
 .watch-control-label:hover { color: #38bdf8; background: rgb(255 255 255 / .08); }
 .watch-control-label:focus-visible { outline: 2px solid #38bdf8; outline-offset: -2px; }
@@ -310,6 +324,9 @@ body {
   .watch-main { padding: 20px; }
   .watch-sidebar { padding: 14px; }
   .watch-artplayer .art-control-prev-episode, .watch-artplayer .art-control-screenshot { display: none; }
+  .watch-artplayer.art-fullscreen .art-control-prev-episode,
+  .watch-artplayer.art-fullscreen-web .art-control-prev-episode,
+  .watch-artplayer.is-mobile-fullscreen .art-control-prev-episode { display: flex; }
 }
 @media (max-width: 900px) {
   .watch-layout { grid-template-columns: minmax(0, 1fr); }
@@ -336,7 +353,7 @@ body {
   .watch-artplayer .art-controls-right { gap: 0; }
   .watch-artplayer .art-control-fullscreenWeb { display: none !important; }
   .watch-artplayer .art-controls-right .art-control { width: 32px !important; min-width: 32px !important; }
-  .watch-artplayer .art-controls-right .art-control-quick-speed, .watch-artplayer .art-controls-right .art-control-episode-menu { min-width: 36px !important; width: auto !important; }
+  .watch-artplayer .art-controls-right .art-control-quick-speed, .watch-artplayer .art-controls-right .art-control-episode-menu, .watch-artplayer .art-controls-right .art-control-tools { min-width: 36px !important; width: auto !important; }
   .watch-control-label { padding: 6px; font-size: 12px; }
   .watch-artplayer .art-control-time { font-size: 10px; }
   .watch-player-title { padding: 12px 14px 26px; font-size: 12px; }
@@ -353,6 +370,34 @@ body {
 @media (hover: none) and (pointer: coarse) {
   .art-control-fullscreenWeb { display: none !important; }
 }
+
+/* 手机手势：进度/音量/亮度浮层，锁屏，以及 PotPlayer 菜单。 */
+.has-mobile-gestures { touch-action: none; }
+.has-mobile-gestures .art-bottom,
+.has-mobile-gestures .art-controls,
+.has-mobile-gestures .art-settings,
+.has-mobile-gestures .watch-player-menu,
+.has-mobile-gestures .watch-mobile-lock,
+.has-mobile-gestures .watch-gesture-coach { touch-action: manipulation; }
+.art-video-player.is-gesture-locked .art-bottom,
+.art-video-player.is-gesture-locked .art-controls,
+.art-video-player.is-gesture-locked .art-settings { visibility: hidden !important; pointer-events: none !important; }
+.watch-gesture-hud { position: absolute; left: 50%; top: 42%; z-index: 35; min-width: 112px; transform: translate(-50%, -50%); padding: 12px 16px; border-radius: 12px; background: rgb(0 0 0 / .72); color: #fff; text-align: center; font-size: 15px; font-variant-numeric: tabular-nums; pointer-events: none; }
+.watch-gesture-meter { height: 3px; margin-top: 8px; overflow: hidden; border-radius: 99px; background: rgb(255 255 255 / .25); }
+.watch-gesture-meter span { display: block; height: 100%; background: #7dd3fc; }
+.watch-mobile-lock { position: absolute; right: max(8px, env(safe-area-inset-right)); top: 50%; z-index: 40; min-width: 44px; min-height: 44px; transform: translateY(-50%); padding: 8px 10px; border-radius: 999px; background: rgb(0 0 0 / .55); color: #fff; font-size: 12px; }
+.watch-mobile-lock.is-active { background: rgb(14 165 233 / .92); }
+.art-video-player:not(.art-control-show) .watch-mobile-lock:not(.is-active) { opacity: 0; pointer-events: none; }
+.watch-gesture-coach { position: absolute; left: 12px; right: 72px; bottom: 72px; z-index: 36; padding: 10px 12px; border-radius: 10px; background: rgb(0 0 0 / .75); color: #e2e8f0; font-size: 12px; line-height: 1.5; }
+.watch-gesture-coach button { margin-top: 6px; color: #7dd3fc; }
+.watch-tool-label { margin: 12px 0 6px; color: #94a3b8; font-size: 12px; }
+.watch-tool-label:first-child { margin-top: 0; }
+.watch-tool-note { margin: 0 0 6px; color: #94a3b8; font-size: 12px; font-variant-numeric: tabular-nums; }
+.watch-potplayer-menu { position: absolute; z-index: 50; top: calc(100% + 4px); left: 0; width: 240px; padding: 6px; border: 1px solid rgb(var(--c-line)); border-radius: 8px; background: rgb(var(--c-surface)); box-shadow: 0 8px 24px rgb(0 0 0 / .18); }
+.watch-potplayer-menu.is-end { left: auto; right: 0; }
+.watch-potplayer-menu button { display: block; width: 100%; padding: 8px 10px; border-radius: 6px; text-align: left; font-size: 12px; color: rgb(var(--c-content)); }
+.watch-potplayer-menu button:hover { background: rgb(var(--c-chip)); }
+.watch-potplayer-menu p { padding: 4px 10px 8px; font-size: 11px; line-height: 1.45; color: rgb(var(--c-faint)); }
 
 /* 手机全屏：系统横屏锁定成功时补上刘海安全区。 */
 .art-video-player.is-mobile-fullscreen:not(.needs-rotate) .art-bottom {

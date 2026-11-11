@@ -21,6 +21,9 @@ import { loadCacheSettings } from '@/lib/video-cache';
 import { formatTime } from '@/lib/utils';
 import { prefersTouchPointer } from '@/lib/touch-pointer';
 import { attachMobileFullscreen, attachTouchControlHide } from '@/lib/mobile-fullscreen';
+import { attachMobilePlayer, type GestureHud } from '@/lib/mobile-player';
+import { attachProgressScrub } from '@/lib/progress-scrub';
+import { GestureChrome } from './gesture-chrome';
 import {
   findActiveSegment,
   findCrossedEnding,
@@ -42,7 +45,7 @@ const round1 = (v: number) => Math.round(v * 10) / 10;
 
 /**
  * 播放器外壳：ArtPlayer + hls.js（旧版 player.js 的 React 化）。
- * 保留：广告分片过滤、自动连播回调、进度回调、快捷键、移动端长按倍速、错误恢复。
+ * 保留：广告分片过滤、自动连播回调、进度回调、快捷键、手机手势播放、错误恢复。
  * 移除：DOM 手工操作、watch.html 跳转链、localStorage 状态总线。
  *
  * 关键设计：ArtPlayer 实例只在挂载时创建一次，换集（url 变化）只「切换 HLS 源」
@@ -160,7 +163,20 @@ export function PlayerShell({
   const [error, setError] = useState('');
   const [hint, setHint] = useState('');
   const [overlayHost, setOverlayHost] = useState<HTMLElement | null>(null);
-  const [menu, setMenu] = useState<'speed' | 'episodes' | null>(null);
+  const [menu, setMenu] = useState<'speed' | 'episodes' | 'tools' | null>(null);
+  const [touchUi, setTouchUi] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const lockedRef = useRef(false);
+  const [gestureHud, setGestureHud] = useState<GestureHud | null>(null);
+  const hudSetter = useRef<(hud: GestureHud | null) => void>(() => {});
+  hudSetter.current = setGestureHud;
+  const [aspect, setAspect] = useState<'default' | 'cover' | '16:9' | '4:3'>('default');
+  const [sleepMin, setSleepMin] = useState<number | null>(null);
+  const sleepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [abLoop, setAbLoop] = useState<{ a: number | null; b: number | null }>({ a: null, b: null });
+  const abRef = useRef(abLoop);
+  abRef.current = abLoop;
+  useEffect(() => { setTouchUi(prefersTouchPointer()); }, []);
   const [playbackRate, setPlaybackRate] = useState(1);
   const menuRef = useRef<HTMLDivElement>(null);
   useFocusTrap(menu !== null, menuRef);
@@ -582,6 +598,13 @@ export function PlayerShell({
     episodeButton.setAttribute('aria-label', '播放器内选集');
     episodeButton.setAttribute('aria-haspopup', 'dialog');
     episodeButton.onclick = () => setMenu((prev) => prev === 'episodes' ? null : 'episodes');
+    const toolsButton = document.createElement('button');
+    toolsButton.type = 'button';
+    toolsButton.className = 'watch-control-label';
+    toolsButton.textContent = '功能';
+    toolsButton.setAttribute('aria-label', '画面、定时和循环');
+    toolsButton.setAttribute('aria-haspopup', 'dialog');
+    toolsButton.onclick = () => setMenu((prev) => prev === 'tools' ? null : 'tools');
 
     const art = new Artplayer({
       container: containerRef.current,
@@ -615,6 +638,7 @@ export function PlayerShell({
       controls: [
         { name: 'quick-speed', index: 5, position: 'right', html: speedButton },
         { name: 'episode-menu', index: 6, position: 'right', html: episodeButton },
+        ...(touchPointer ? [{ name: 'tools', index: 7, position: 'right' as const, html: toolsButton }] : []),
         {
           name: 'prev-episode',
           index: 11,
@@ -647,6 +671,20 @@ export function PlayerShell({
     setOverlayHost(art.template.$player);
     const mobileFullscreen = touchPointer ? attachMobileFullscreen(art.template.$player) : null;
     const releaseTouchControls = touchPointer ? attachTouchControlHide(art) : null;
+    // 触摸手势不看 hover 媒体查询：不少手机浏览器报 hover: hover，查不到就被整段跳过。
+    // 鼠标不会产生 touch 事件，桌面点击不受影响。
+    const releaseGestures = attachMobilePlayer(art.template.$player, {
+      getVideo: () => art.video,
+      allowSeek: true,
+      allowRateBoost: true,
+      getLocked: () => lockedRef.current,
+      onHud: (hud) => hudSetter.current(hud),
+    });
+    const releaseScrub = attachProgressScrub(art.template.$player, {
+      getVideo: () => art.video,
+      onActive: () => { art.controls.show = true; },
+    });
+    if (lockedRef.current) art.template.$player.classList.add('is-gesture-locked');
 
     // 音量放大：起播后（src 已就绪）才挂 Web Audio 增益图，避免空 src / CORS 误判。
     // 默认关闭（设置项 volumeBoost）：不接入时完全不碰音频链路。
@@ -693,7 +731,8 @@ export function PlayerShell({
       const video = art.video;
       setPlaybackRate(video.playbackRate);
       speedButton.textContent = video.playbackRate === 1 ? '倍速' : `${video.playbackRate}×`;
-      if (video && video.playbackRate !== video.defaultPlaybackRate) {
+      // 长按的 3 倍速是临时的，不能写进默认倍速，否则松手后会被下一次加载弹回去。
+      if (video && video.dataset.boosting !== '1' && video.playbackRate !== video.defaultPlaybackRate) {
         video.defaultPlaybackRate = video.playbackRate;
       }
     });
@@ -772,6 +811,11 @@ export function PlayerShell({
       setError('视频播放失败，请尝试其他视频源');
     });
     art.on('video:timeupdate', () => {
+      const loop = abRef.current;
+      if (loop.a != null && loop.b != null && loop.b > loop.a && art.currentTime >= loop.b) {
+        try { art.currentTime = loop.a; } catch { /* 忽略 */ }
+        return;
+      }
       const now = Date.now();
       if (now - lastSave > 5000) {
         lastSave = now;
@@ -870,8 +914,10 @@ export function PlayerShell({
 
     // —— 键盘快捷键（旧版 hotkey:false + 自定义逻辑的移植） ——
     const shortcuts = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement;
-      // 输入框或按钮获得焦点时不劫持按键：否则空格会吞掉按钮的默认激活
+      const target = e.target;
+      // 输入框或按钮获得焦点时不劫持按键：否则空格会吞掉按钮的默认激活。
+      // target 不一定是元素（例如事件打到 document 上）。
+      if (!(target instanceof Element)) return;
       if (target.closest('input, textarea, select, button, [contenteditable="true"], [role="dialog"]')) return;
       if (e.ctrlKey || e.metaKey) return;
       const current = artRef.current;
@@ -942,10 +988,6 @@ export function PlayerShell({
     };
     document.addEventListener('keydown', shortcuts);
 
-    // —— 移动端长按 3 倍速 ——
-    let longPressTimer: ReturnType<typeof setTimeout> | null = null;
-    let isLongPress = false;
-    let originalRate = 1.0;
     const el = containerRef.current;
 
     // 全屏时播放器覆盖整个视口，无法依赖 mouseleave 判断“移出播放器”。
@@ -972,41 +1014,6 @@ export function PlayerShell({
       showControlsOnPointerMove();
     }
 
-    const onTouchStart = (e: TouchEvent) => {
-      if (art.video?.paused) return;
-      // 已有触控在处理时忽略新手指：否则第二指会把 originalRate 捕获成 3.0，
-      // 松手后倍速永久卡在 3x；旧定时器句柄也会被覆盖成无法清除的幽灵触发
-      if (isLongPress || longPressTimer) return;
-      // 控制栏 / 设置面板上的长按不触发倍速（按住进度条拖动、长按倍速菜单项会误触）
-      if ((e.target as HTMLElement).closest?.('.art-controls, .art-settings, .watch-player-menu')) return;
-      originalRate = art.video.playbackRate;
-      longPressTimer = setTimeout(() => {
-        if (art.video?.paused) return;
-        art.video.playbackRate = 3.0;
-        isLongPress = true;
-        showHint('3 倍速');
-      }, 500);
-    };
-    const onTouchEnd = () => {
-      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-      if (isLongPress) {
-        art.video.playbackRate = originalRate;
-        isLongPress = false;
-        showHint(`${originalRate} 倍速`);
-      }
-    };
-    const onTouchMove = (e: TouchEvent) => {
-      if (isLongPress) e.preventDefault();
-    };
-    // ArtPlayer 的 contextmenu 组件只在桌面端初始化（移动端构造函数里跳过 init），
-    // 长按倍速因而会连带呼出系统原生菜单/气泡。播放器表面没有可用的原生菜单，统一抑制
-    const onContextMenu = (e: Event) => e.preventDefault();
-    el?.addEventListener('touchstart', onTouchStart, { passive: false });
-    el?.addEventListener('touchend', onTouchEnd);
-    el?.addEventListener('touchcancel', onTouchEnd);
-    el?.addEventListener('touchmove', onTouchMove, { passive: false });
-    el?.addEventListener('contextmenu', onContextMenu);
-
     // 卸载与页面隐藏时保存进度
     const saveOnHide = () => {
       if (document.visibilityState === 'hidden' && !endedRef.current) {
@@ -1029,11 +1036,6 @@ export function PlayerShell({
       volumeBoostRef.current = null;
       if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
       if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
-      el?.removeEventListener('touchstart', onTouchStart);
-      el?.removeEventListener('touchend', onTouchEnd);
-      el?.removeEventListener('touchcancel', onTouchEnd);
-      el?.removeEventListener('touchmove', onTouchMove);
-      el?.removeEventListener('contextmenu', onContextMenu);
       art.video?.removeEventListener('resize', reportVideoHeight);
       el?.removeEventListener('mousemove', showControlsOnPointerMove);
       el?.removeEventListener('mouseleave', hideControlsOnMouseLeave);
@@ -1041,8 +1043,11 @@ export function PlayerShell({
       restoreCleanupRef.current?.();
       restoreCleanupRef.current = null;
       Artplayer.CONTROL_HIDE_TIME = ART_DEFAULT_CONTROL_HIDE_MS;
+      if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current);
       mobileFullscreen?.dispose();
       releaseTouchControls?.();
+      releaseGestures();
+      releaseScrub();
       hlsRef.current?.destroy();
       hlsRef.current = null;
       recoveryRef.current?.dispose();
@@ -1121,6 +1126,8 @@ export function PlayerShell({
   useEffect(() => {
     // 挂载时的首次由创建 effect 的 customType 触发，跳过避免重复加载
     if (firstUrlRef.current) { firstUrlRef.current = false; return; }
+    abRef.current = { a: null, b: null };
+    setAbLoop({ a: null, b: null });
     loadEpisode(url);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url]);
@@ -1136,6 +1143,93 @@ export function PlayerShell({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adFilter]);
 
+  const applyAspect = (mode: 'default' | 'cover' | '16:9' | '4:3') => {
+    const player = artRef.current;
+    const video = player?.video as HTMLVideoElement | undefined;
+    if (!player || !video) return;
+    setAspect(mode);
+    try { player.aspectRatio = mode === 'cover' ? 'default' : mode; } catch { /* 播放器未就绪 */ }
+    video.style.objectFit = mode === 'cover' ? 'cover' : '';
+  };
+  const armSleep = (minutes: number | null) => {
+    if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current);
+    sleepTimerRef.current = null;
+    setSleepMin(minutes);
+    if (minutes == null) {
+      showHint('已取消定时关闭');
+      return;
+    }
+    sleepTimerRef.current = setTimeout(() => {
+      sleepTimerRef.current = null;
+      setSleepMin(null);
+      try { artRef.current?.pause(); } catch { /* 忽略 */ }
+      showHint('定时关闭，已暂停');
+    }, minutes * 60_000);
+    showHint(`${minutes} 分钟后暂停`);
+  };
+  const markLoopStart = () => {
+    const time = round1(artRef.current?.currentTime ?? 0);
+    const next = { a: time, b: abRef.current.b != null && abRef.current.b > time ? abRef.current.b : null };
+    abRef.current = next;
+    setAbLoop(next);
+    showHint('已记录循环起点');
+  };
+  const markLoopEnd = () => {
+    const start = abRef.current.a;
+    const time = round1(artRef.current?.currentTime ?? 0);
+    if (start == null) { showHint('请先设循环起点'); return; }
+    if (time <= start) { showHint('终点需要晚于起点'); return; }
+    const next = { a: start, b: time };
+    abRef.current = next;
+    setAbLoop(next);
+    showHint('已开始 AB 循环');
+  };
+  const takeScreenshot = () => {
+    try {
+      artRef.current?.screenshot?.();
+      setMenu(null);
+    } catch {
+      showHint('当前画面无法截图');
+    }
+  };
+  const togglePip = async () => {
+    const video = artRef.current?.video as (HTMLVideoElement & {
+      webkitSetPresentationMode?: (mode: string) => void;
+      webkitPresentationMode?: string;
+    }) | undefined;
+    if (!video) return;
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        return;
+      }
+      if (document.pictureInPictureEnabled) {
+        await video.requestPictureInPicture();
+        setMenu(null);
+        return;
+      }
+      if (video.webkitSetPresentationMode) {
+        video.webkitSetPresentationMode(video.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture');
+        setMenu(null);
+        return;
+      }
+      showHint('这个浏览器没有画中画');
+    } catch {
+      showHint('画中画被浏览器拒绝');
+    }
+  };
+  const toggleLock = () => {
+    const next = !lockedRef.current;
+    lockedRef.current = next;
+    setLocked(next);
+    const root = artRef.current?.template?.$player as HTMLElement | undefined;
+    root?.classList.toggle('is-gesture-locked', next);
+    if (next) {
+      try { artRef.current.controls.show = false; } catch { /* 忽略 */ }
+      setMenu(null);
+    }
+  };
+
   return (
     <div className="watch-player relative w-full h-full">
       <div ref={containerRef} className="w-full h-full" style={{ WebkitTouchCallout: 'none' }} />
@@ -1146,23 +1240,67 @@ export function PlayerShell({
           </div>
           {menu && (
             <div className="watch-menu-backdrop" onClick={() => setMenu(null)}>
-              <div ref={menuRef} role="dialog" aria-modal="true" aria-label={menu === 'speed' ? '播放速度' : '播放器内选集'} tabIndex={-1} className="watch-player-menu" onClick={(event) => event.stopPropagation()}>
+              <div ref={menuRef} role="dialog" aria-modal="true" aria-label={menu === 'speed' ? '播放速度' : menu === 'episodes' ? '播放器内选集' : '播放功能'} tabIndex={-1} className="watch-player-menu" onClick={(event) => event.stopPropagation()}>
                 <div className="watch-player-menu-heading">
-                  <h2>{menu === 'speed' ? '播放速度' : `选集 · 共 ${episodeCount} 集`}</h2>
+                  <h2>{menu === 'speed' ? '播放速度' : menu === 'episodes' ? `选集 · 共 ${episodeCount} 集` : '播放功能'}</h2>
                   <button type="button" aria-label="关闭播放器面板" onClick={() => setMenu(null)}><Icon name="close" className="w-4 h-4" /></button>
                 </div>
-                <div className={menu === 'speed' ? 'watch-speed-options' : 'watch-player-episodes'}>
-                  {menu === 'speed'
-                    ? [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3].map((rate) => (
-                      <button key={rate} type="button" aria-pressed={playbackRate === rate} onClick={() => { if (artRef.current) artRef.current.playbackRate = rate; setMenu(null); }}>{rate === 1 ? '正常' : `${rate}×`}</button>
-                    ))
-                    : Array.from({ length: episodeCount }, (_, index) => (
-                      <button key={index} type="button" aria-label={`播放第 ${index + 1} 集`} aria-current={index === currentEpisode ? 'true' : undefined} onClick={() => { onSelectEpisode?.(index); setMenu(null); }}>{String(index + 1).padStart(2, '0')}</button>
-                    ))}
-                </div>
+                {menu === 'tools' ? (
+                  <div>
+                    <p className="watch-tool-label">画面</p>
+                    <div className="watch-speed-options">
+                      {(['default', 'cover', '16:9', '4:3'] as const).map((mode) => (
+                        <button key={mode} type="button" aria-pressed={aspect === mode} onClick={() => applyAspect(mode)}>
+                          {mode === 'default' ? '适应' : mode === 'cover' ? '铺满' : mode}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="watch-tool-label">定时关闭</p>
+                    <div className="watch-speed-options">
+                      {([null, 15, 30, 60] as const).map((minutes) => (
+                        <button key={minutes ?? 'off'} type="button" aria-pressed={sleepMin === minutes} onClick={() => armSleep(minutes)}>
+                          {minutes == null ? '关' : `${minutes} 分钟`}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="watch-tool-label">AB 循环</p>
+                    <p className="watch-tool-note">
+                      {abLoop.a == null ? '还没有起点' : `A ${formatTime(abLoop.a)}`}
+                      {abLoop.b != null ? ` · B ${formatTime(abLoop.b)}` : ''}
+                    </p>
+                    <div className="watch-speed-options">
+                      <button type="button" onClick={markLoopStart}>设起点</button>
+                      <button type="button" onClick={markLoopEnd}>设终点</button>
+                      <button type="button" onClick={() => { abRef.current = { a: null, b: null }; setAbLoop({ a: null, b: null }); showHint('已取消循环'); }}>清除</button>
+                    </div>
+                    <p className="watch-tool-label">其他</p>
+                    <div className="watch-speed-options">
+                      <button type="button" onClick={takeScreenshot}>截图</button>
+                      <button type="button" onClick={() => { void togglePip(); }}>画中画</button>
+                      <button type="button" onClick={toggleLock}>锁屏</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className={menu === 'speed' ? 'watch-speed-options' : 'watch-player-episodes'}>
+                    {menu === 'speed'
+                      ? [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3].map((rate) => (
+                        <button key={rate} type="button" aria-pressed={playbackRate === rate} onClick={() => { if (artRef.current) artRef.current.playbackRate = rate; setMenu(null); }}>{rate === 1 ? '正常' : `${rate}×`}</button>
+                      ))
+                      : Array.from({ length: episodeCount }, (_, index) => (
+                        <button key={index} type="button" aria-label={`播放第 ${index + 1} 集`} aria-current={index === currentEpisode ? 'true' : undefined} onClick={() => { onSelectEpisode?.(index); setMenu(null); }}>{String(index + 1).padStart(2, '0')}</button>
+                      ))}
+                  </div>
+                )}
               </div>
             </div>
           )}
+          <GestureChrome
+            active={touchUi}
+            hud={gestureHud}
+            locked={locked}
+            coach="双击左侧快退、右侧快进。左右滑调整进度，左侧上下滑调亮度，右侧上下滑调音量，长按临时 3 倍速。"
+            onToggleLock={toggleLock}
+          />
       {showPoster && !error && (
         <div className="absolute inset-0 bg-[#050a12] flex flex-col items-center justify-center gap-3 pointer-events-none" role="status">
           <div className="w-8 h-8 rounded-full border-2 border-slate-700 border-t-sky-400 animate-spin" />

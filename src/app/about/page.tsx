@@ -24,7 +24,8 @@ export default function AboutPage() {
             <li><code className="text-accent">↑</code> / <code className="text-accent">↓</code> 音量调节</li>
             <li><code className="text-accent">F</code> 切换全屏</li>
             <li><code className="text-accent">Alt + ←/→</code> 上一集 / 下一集</li>
-            <li>移动端长按视频可 3 倍速播放</li>
+            <li>手机：双击两侧快退/快进，左右滑进度，左侧滑亮度，右侧滑音量，长按 3 倍速</li>
+            <li>Windows 可把原始地址交给 PotPlayer，或下载 .dpl 播放列表</li>
           </ul>
         </section>
 

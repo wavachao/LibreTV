@@ -36,6 +36,20 @@ export function unlockLandscape(screenLike: { orientation?: unknown } | null | u
   }
 }
 
+/**
+ * 方向锁只在视口真的横过来之后才算数。
+ * 锁屏会让系统把锁解开、屏幕回到竖屏，但调用方可能还记着「已经锁过」。
+ * 这时若继续相信旧标记，内层就不会再转 90°，解锁后画面就是竖的。
+ */
+export function effectiveLandscapeLock(width: number, height: number, landscapeLocked: boolean): boolean {
+  return landscapeLocked && width >= height;
+}
+
+/** 页面被锁屏藏起来时，全屏被系统拿走不是用户要退出。 */
+export function fullscreenLossAction(visibility: 'visible' | 'hidden'): 'exit' | 'keep' {
+  return visibility === 'hidden' ? 'keep' : 'exit';
+}
+
 /** 外层已经是横屏时铺满；外层仍是竖屏时，内层转 90° 后正好盖住外层。 */
 export function stageBox(width: number, height: number, landscapeAlready: boolean): {
   left: number;
@@ -102,6 +116,8 @@ export function attachMobileFullscreen(root: HTMLElement): { toggle: () => void;
   let stage: HTMLElement | null = null;
   let placeholder: Comment | null = null;
   let landscapeLocked = false;
+  let resumeOnVisible = false;
+  let leavingTimer: ReturnType<typeof setTimeout> | null = null;
 
   const layout = () => {
     if (!shell || !stage) return;
@@ -115,6 +131,7 @@ export function attachMobileFullscreen(root: HTMLElement): { toggle: () => void;
     }
     const width = fullscreen ? shell.clientWidth || box.width : box.width;
     const height = fullscreen ? shell.clientHeight || box.height : box.height;
+    landscapeLocked = effectiveLandscapeLock(width, height, landscapeLocked);
     const frame = stageBox(width, height, landscapeLocked);
     stage.style.left = `${frame.left}px`;
     stage.style.top = `${frame.top}px`;
@@ -167,6 +184,9 @@ export function attachMobileFullscreen(root: HTMLElement): { toggle: () => void;
   const clear = () => {
     active = false;
     landscapeLocked = false;
+    resumeOnVisible = false;
+    if (leavingTimer) clearTimeout(leavingTimer);
+    leavingTimer = null;
     window.visualViewport?.removeEventListener('resize', onViewport);
     window.visualViewport?.removeEventListener('scroll', onViewport);
     window.removeEventListener('resize', onViewport);
@@ -228,10 +248,50 @@ export function attachMobileFullscreen(root: HTMLElement): { toggle: () => void;
     toggle();
   };
 
+  const relock = async () => {
+    if (!active || !shell || disposed) return;
+    const native = fullscreenElement() === shell || await requestFullscreen(shell);
+    const locked = native ? await lockLandscape(typeof screen === 'undefined' ? undefined : screen) : false;
+    landscapeLocked = false;
+    if (locked) {
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+      const box = viewportBox();
+      if (!active || disposed) return;
+      if (box.width >= box.height) landscapeLocked = true;
+      else unlockLandscape(typeof screen === 'undefined' ? undefined : screen);
+    }
+    if (active) layout();
+  };
+
   const onFullscreenChange = () => {
     if (!active || !shell) return;
     if (fullscreenElement() === shell) return;
-    void exit();
+    // 锁屏时浏览器会先退出全屏，visibility 可能晚一拍才变成 hidden。
+    if (fullscreenLossAction(document.visibilityState === 'hidden' ? 'hidden' : 'visible') === 'keep') {
+      resumeOnVisible = true;
+      return;
+    }
+    if (leavingTimer) clearTimeout(leavingTimer);
+    leavingTimer = setTimeout(() => {
+      leavingTimer = null;
+      if (!active || disposed) return;
+      if (shell && fullscreenElement() === shell) return;
+      if (fullscreenLossAction(document.visibilityState === 'hidden' ? 'hidden' : 'visible') === 'keep') {
+        resumeOnVisible = true;
+        return;
+      }
+      void exit();
+    }, 400);
+  };
+
+  const onVisibility = () => {
+    if (document.visibilityState === 'hidden') {
+      if (active) resumeOnVisible = true;
+      return;
+    }
+    if (!resumeOnVisible) return;
+    resumeOnVisible = false;
+    void relock();
   };
 
   const onKey = (event: KeyboardEvent) => {
@@ -243,6 +303,7 @@ export function attachMobileFullscreen(root: HTMLElement): { toggle: () => void;
   root.addEventListener('click', onClick, true);
   document.addEventListener('fullscreenchange', onFullscreenChange);
   document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+  document.addEventListener('visibilitychange', onVisibility);
   document.addEventListener('keydown', onKey);
 
   return {
@@ -252,6 +313,7 @@ export function attachMobileFullscreen(root: HTMLElement): { toggle: () => void;
       root.removeEventListener('click', onClick, true);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
       document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
+      document.removeEventListener('visibilitychange', onVisibility);
       document.removeEventListener('keydown', onKey);
       void exit();
     },
