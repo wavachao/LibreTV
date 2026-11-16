@@ -62,5 +62,29 @@
   {
     "name": "最大资源",
     "url": "https://zuidazy.me/api.php/provide/vod/"
+  },
+  {
+    "name": "新浪资源",
+    "url": "https://api.xinlangapi.com/xinlangapi.php/provide/vod"
+  },
+  {
+    "name": "魔都资源",
+    "url": "https://www.mdzyapi.com/api.php/provide/vod"
+  },
+  {
+    "name": "iqiyi资源",
+    "url": "https://iqiyizyapi.com/api.php/provide/vod"
+  },
+  {
+    "name": "U酷资源",
+    "url": "https://api.ukuapi.com/api.php/provide/vod"
+  },
+  {
+    "name": "金鹰资源",
+    "url": "https://jyzyapi.com/provide/vod"
+  },
+  {
+    "name": "无尽资源",
+    "url": "https://api.wujinapi.com/api.php/provide/vod"
   }
 ]
