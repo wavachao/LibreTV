@@ -21,6 +21,22 @@ describe('点播播放列表代理', () => {
     mocks.fetch.mockResolvedValue({ res: new Response('<html>blocked</html>'), finalUrl: target });
     expect((await handleProxyRequest(req, target)).status).toBe(502);
   });
+  it('点播 MP4 保留 Range 响应头，取消播放会取消上游请求', async () => {
+    const controller = new AbortController();
+    const request = new Request(req, { headers: { Range: 'bytes=0-3' }, signal: controller.signal });
+    const file = 'https://cdn.example/video.mp4';
+    mocks.fetch.mockResolvedValueOnce({ res: new Response('test', { status: 206, headers: {
+      'Content-Type': 'video/mp4', 'Content-Length': '4', 'Content-Range': 'bytes 0-3/12', 'Accept-Ranges': 'bytes',
+    } }), finalUrl: file });
+    const response = await handleProxyRequest(request, file);
+    expect(response.status).toBe(206);
+    expect(response.headers.get('content-length')).toBe('4');
+    expect(response.headers.get('content-range')).toBe('bytes 0-3/12');
+    const [, options] = mocks.fetch.mock.lastCall!;
+    expect(options.headers.Range).toBe('bytes=0-3');
+    controller.abort();
+    expect(options.signal.aborted).toBe(true);
+  });
   it('带鉴权参数的清单仍按重定向后的地址改写', async () => {
     mocks.fetch.mockResolvedValue({ res: new Response('#EXTM3U\n#EXTINF:10,\na.ts\n'), finalUrl: 'https://media.example/moved/video.m3u8?token=x' });
     const res = await handleProxyRequest(req, target);

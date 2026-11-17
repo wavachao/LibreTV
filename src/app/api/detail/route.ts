@@ -59,20 +59,20 @@ export async function GET(req: Request) {
 
     let resolved: VideoDetail | null = null;
 
-    // 1) 标准列表接口
-    const api = `${source.url.replace(/\/+$/, '')}?ac=videolist&ids=${encodeURIComponent(id)}`;
-    const res = await fetchUpstream(api, { timeoutMs: 10000, headers: cmsRequestHeaders() });
-    if (res.ok) {
-      const data = await res.json();
-      try {
-        const detail = parseDetail(data, source);
-        if (detail.episodes.length > 0) {
-          resolved = detail;
-        }
-        // 有详情但无播放地址 → 继续尝试详情页
-      } catch {
-        // 列表接口无内容 → 继续尝试详情页
+    const deadline = AbortSignal.any([req.signal, AbortSignal.timeout(8500)]);
+    const api = new URL(source.url);
+    api.searchParams.set('ac', 'videolist');
+    api.searchParams.set('ids', id);
+    try {
+      const signal = AbortSignal.any([deadline, AbortSignal.timeout(4500)]);
+      const res = await fetchUpstream(api.href, { signal, headers: cmsRequestHeaders() });
+      if (res.ok) {
+        const detail = parseDetail(await res.json(), source);
+        if (detail.episodes.length > 0) resolved = detail;
       }
+    } catch (error) {
+      if (deadline.aborted) throw error;
+      // 部分源的列表接口没有资源，继续尝试详情页。
     }
 
     // 2) 详情页 HTML 提取
@@ -83,7 +83,7 @@ export async function GET(req: Request) {
       }
       const detailUrl = `${detailRoot}/index.php/vod/detail/id/${id}.html`;
       const detailRes = await fetchUpstream(detailUrl, {
-        timeoutMs: 10000,
+        signal: deadline,
         headers: { 'User-Agent': cmsRequestHeaders()['User-Agent'] },
       });
       if (detailRes.ok) {

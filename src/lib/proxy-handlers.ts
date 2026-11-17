@@ -93,12 +93,15 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
   let response: Response | undefined;
   let finalUrl = targetUrl;
   let lastError: unknown = null;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  let bodyController: AbortController | undefined;
+  for (let attempt = 0; attempt <= MAX_RETRIES && !req.signal.aborted; attempt++) {
+    const controller = new AbortController();
     try {
       const result = await fetchWithSafeRedirects(targetUrl, {
         headers,
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
+        signal: AbortSignal.any([req.signal, controller.signal]),
+      }, { headerTimeoutMs: TIMEOUT_MS });
+      bodyController = controller;
       response = result.res;
       finalUrl = result.finalUrl;
       lastError = null;
@@ -108,6 +111,7 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
     }
   }
   if (!response) {
+    if (req.signal.aborted) return new NextResponse(null, { status: 499 });
     return new NextResponse(
       `代理请求失败: ${lastError instanceof Error ? lastError.message : '未知错误'}`,
       { status: 502 }
@@ -128,7 +132,15 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
 
   // m3u8 文本：重写为代理地址（以重定向后的最终 URL 为 base 解析相对地址）
   if (isM3u8) {
-    const text = await response.text();
+    const bodyTimer = setTimeout(() => bodyController?.abort(), TIMEOUT_MS);
+    let text: string;
+    try {
+      text = await response.text();
+    } catch {
+      return jsonError('未能读取上游 HLS 播放列表', 502);
+    } finally {
+      clearTimeout(bodyTimer);
+    }
     if (!text.trimStart().startsWith('#EXTM3U')) return jsonError('上游未返回有效的 HLS 播放列表', 502);
     return new NextResponse(rewriteM3u8(text, finalUrl), {
       status: response.status,
@@ -146,7 +158,9 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
     const v = response.headers.get(name);
     if (v) outHeaders.set(name, v);
   }
-  // fetch 会自动解压，转发时必须去掉长度相关头避免浏览器二次解压
+  // 未压缩的 MP4/Range 响应保留长度，以便原生播放器及时建立可拖动的时间轴。
+  const length = response.headers.get('content-length');
+  if (length && !response.headers.has('content-encoding')) outHeaders.set('Content-Length', length);
   // 图片基本不变：长缓存交给浏览器与边缘 CDN（分片 / key 仍保守 1 小时）
   outHeaders.set(
     'Cache-Control',
@@ -163,9 +177,8 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
 /**
  * 直播流专用长连接代理（不复用 /api/proxy）：
  *
- * /api/proxy 的 AbortSignal.timeout(TIMEOUT_MS) 作用于整个响应流，
- * 8 秒后即切断长连接——对 HTTP-FLV（单一无限长连接）是致命的。
- * 本路由改为「仅对响应头等待设超时」（fetchWithSafeRedirects 的
+ * 直播与点播的响应头都设有超时，直播另行处理内容类型与私网直播源的配置。
+ * 对响应头等待设超时（fetchWithSafeRedirects 的
  * headerTimeoutMs）：fetch 拿到响应头后立即清除计时器，
  * 之后 body 无限时长流式透传，直到客户端断开。
  *

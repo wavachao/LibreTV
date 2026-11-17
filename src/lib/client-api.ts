@@ -1,5 +1,6 @@
 'use client';
 
+import { queryOptions } from '@tanstack/react-query';
 import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, DoubanResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload, QualityProbeItem, QualityProbeResult } from './types';
 
 /**
@@ -37,6 +38,18 @@ export interface LiveProbeResult {
 
 /** /api/status 的 React Query key：Providers 与 AuthProvider 共用，避免同一页面重复请求 */
 export const STATUS_QUERY_KEY = ['app-status'] as const;
+
+export const VIDEO_DETAIL_STALE_MS = 5 * 60_000;
+
+export function videoDetailOptions(id: string, source?: SourceConfig) {
+  return queryOptions({
+    queryKey: ['detail', source?.key, id, source?.url, source?.detail] as const,
+    queryFn: ({ signal }) => api.detail(id, source!, signal),
+    enabled: Boolean(id && source),
+    staleTime: VIDEO_DETAIL_STALE_MS,
+    retry: false,
+  });
+}
 
 export function onUnauthorized(handler: (event: CustomEvent) => void): () => void {
   const wrapped = (e: Event) => handler(e as CustomEvent);

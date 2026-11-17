@@ -1,25 +1,18 @@
 import type HlsType from 'hls.js';
 import { stripAdGroups } from './m3u8';
-import { buildSegmentCacheKey, readCachedSegment, touchMeta } from './video-cache';
+import { takeWarmedPlaylist } from './video-prefetcher';
+import {
+  buildSegmentCacheKey,
+  loadCacheSettings,
+  putCachedSegmentResilient,
+  readCachedSegment,
+  scheduleQuotaCheck,
+  touchMeta,
+} from './video-cache';
 
-/**
- * hls.js loader 工厂：在同一个 loader 里组合「广告过滤」与「片段缓存命中」。
- *
- * - manifest / level：走基类网络加载；blockAd 开启时在 onSuccess 里剔除
- *   片头插入的广告段（整段移除，保留 DISCONTINUITY 时间轴标记）；
- * - fragment：cache-first——本地缓存命中直接合成响应（不回源），未命中走基类。
- *   BYTERANGE 分片（原文件切片）不缓存、直接回源。
- *
- * 关键细节：缓存命中时用预取阶段记录的**真实耗时**（costMs）合成 hls.js 的
- * loader stats——如果让加载时长为 0，ABR 会把它当成无限带宽，错误地拉高码率。
- *
- * hls.js 对每次请求都会 new 一个 loader 实例，因此实例上的 destroyed 标记
- * 生命周期安全（abort/destroy 后不再回调，防孤儿 onSuccess）。
- */
 interface LoaderOptions {
   blockAd?: boolean;
-  /** 缓存命中探针（设置面板展示命中率用），可缺省 */
-  onProbe?: (hit: boolean) => void;
+  episodeKey?: string;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -27,11 +20,9 @@ type HlsLoaderCtor = new (config: any) => any;
 
 export function createHlsLoader(
   HlsCtor: typeof HlsType,
-  options: LoaderOptions = {}
+  { blockAd = false, episodeKey }: LoaderOptions = {}
 ): HlsLoaderCtor {
-  const { blockAd = false, onProbe } = options;
-
-  return class CacheFirstHlsLoader extends (HlsCtor.DefaultConfig.loader as HlsLoaderCtor) {
+  return class CachedHlsLoader extends (HlsCtor.DefaultConfig.loader as HlsLoaderCtor) {
     private destroyed = false;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -40,58 +31,65 @@ export function createHlsLoader(
       const load = this.load.bind(this);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      this.load = (context: any, config: any, callbacks: any) => {
-        const isPlaylist = context.type === 'manifest' || context.type === 'level';
-
-        // —— 播放列表：网络加载 + 可选广告过滤 ——
-        if (isPlaylist) {
-           
-          if (blockAd) {
-             
-            const onSuccess = callbacks.onSuccess;
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            callbacks.onSuccess = function (response: any, stats: any, ctx: any, networkDetails: any) {
-              if (response.data && typeof response.data === 'string') {
-                response.data = stripAdGroups(response.data);
-              }
-              onSuccess(response, stats, ctx, networkDetails);
-            };
-          }
-          load(context, config, callbacks);
-          return;
-        }
-
-        // —— BYTERANGE 分片：整文件切片，无法独立缓存，直接回源 ——
-        if (context.rangeStart || context.rangeEnd) {
-          load(context, config, callbacks);
-          return;
-        }
-
-        // —— 片段：cache-first ——
+      this.load = async (context: any, requestConfig: any, callbacks: any) => {
+        const settings = episodeKey ? loadCacheSettings() : undefined;
+        const cacheEnabled = settings?.enabled && typeof caches !== 'undefined';
+        const originalSuccess = callbacks.onSuccess;
         const key = buildSegmentCacheKey(context.url);
-        readCachedSegment(key).then((hit) => {
-          if (this.destroyed) return;
-          if (hit) {
-            void touchMeta(key);
-            onProbe?.(true);
-            const now = performance.now();
-            Object.assign(this.stats, {
-              loading: { start: now - hit.costMs, first: now - hit.costMs + 1, end: now },
-              total: hit.data.byteLength,
-              loaded: hit.data.byteLength,
-            });
-            callbacks.onSuccess({ url: context.url, data: hit.data }, this.stats, context, undefined);
-            return;
-          }
-          onProbe?.(false);
-           
-          const onSuccess = callbacks.onSuccess;
+        const setStats = (bytes: number, costMs: number) => {
+          const end = performance.now();
+          const start = end - Math.max(2, costMs);
+          Object.assign(this.stats, { loading: { start, first: start + 1, end }, loaded: bytes, total: bytes });
+        };
+
+        if (context.type === 'manifest' || context.type === 'level') {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           callbacks.onSuccess = (response: any, stats: any, ctx: any, networkDetails: any) => {
-            if (!this.destroyed) onSuccess(response, stats, ctx, networkDetails);
+            if (blockAd && typeof response.data === 'string') response.data = stripAdGroups(response.data);
+            originalSuccess(response, stats, ctx, networkDetails);
           };
-          load(context, config, callbacks);
-        });
+          const warmed = cacheEnabled ? takeWarmedPlaylist(key) : undefined;
+          if (warmed) {
+            // hls.js 在 load 返回后才完成部分初始化，保留网络回调的异步语义。
+            await Promise.resolve();
+            if (this.destroyed) return;
+            setStats(warmed.data.length, 2);
+            callbacks.onSuccess({ url: warmed.url, data: warmed.data }, this.stats, context, undefined);
+          } else {
+            load(context, requestConfig, callbacks);
+          }
+          return;
+        }
+
+        // hls.js 用 0/0 表示整片。只有有效区间才会发送 Range。
+        if (!episodeKey || !settings || !cacheEnabled || context.type !== 'media-fragment' ||
+            context.part || context.rangeEnd > context.rangeStart) {
+          load(context, requestConfig, callbacks);
+          return;
+        }
+
+        const cached = await readCachedSegment(key);
+        if (this.destroyed) return;
+        if (cached) {
+          void touchMeta(key);
+          // 保留真实下载耗时，避免缓存命中将自适应码率误判成无限带宽。
+          setStats(cached.data.byteLength, cached.costMs);
+          originalSuccess({ url: context.url, data: cached.data }, this.stats, context, undefined);
+          return;
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        callbacks.onSuccess = (response: any, stats: any, ctx: any, networkDetails: any) => {
+          if (this.destroyed) return;
+          if (response.data instanceof ArrayBuffer && response.data.byteLength) {
+            const index = typeof context.frag.sn === 'number' ? context.frag.sn : 0;
+            const costMs = stats.loading.end - stats.loading.start;
+            void putCachedSegmentResilient(key, response.data, { episodeKey, index, costMs, settings })
+              .then(() => scheduleQuotaCheck(settings));
+          }
+          originalSuccess(response, stats, ctx, networkDetails);
+        };
+        load(context, requestConfig, callbacks);
       };
     }
 

@@ -164,6 +164,10 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel, volumeBoo
 
     /** HLS 直播参数：小缓冲、快速追帧；与点播（大缓冲、进度恢复）刻意区分 */
     const setupHls = (video: HTMLVideoElement, mediaUrl: string, stage: 'direct' | 'proxy') => {
+      if (!Hls.isSupported()) {
+        setupNative(video, mediaUrl, stage === 'direct');
+        return;
+      }
       cleanupEngines();
       let liveNetRetryCount = 0;
       let mediaRecoverCount = 0;
@@ -194,6 +198,12 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel, volumeBoo
           }
         }
         video.play().catch(() => {});
+      });
+      hls.on(Hls.Events.FRAG_BUFFERED, (_evt, { frag }) => {
+        if (frag.type === 'main' && frag.sn !== 'initSegment' && playbackStarted) {
+          liveNetRetryCount = 0;
+          mediaRecoverCount = 0;
+        }
       });
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         if (disposed || destroyed) return;

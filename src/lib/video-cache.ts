@@ -5,7 +5,7 @@ import { documentBaseURI } from './m3u8';
  * 视频片段本地缓存层。
  *
  * 职责边界：Cache Storage 读写 + IndexedDB（Dexie segmentMeta 表）元数据 + 两轮 LRU 淘汰。
- * 不做任何与播放器状态相关的判断，因此预取循环可以在视频暂停、页面切到后台时继续工作。
+ * 播放器复用自己加载的片段，接近片尾时仅预热下一集开头。
  *
  * 为什么不用 Service Worker：
  *   1. 播放器本来就在替换 hls.js 的 loader（广告过滤 + 缓存命中），叠加 cache-first 零注册成本；
@@ -23,8 +23,6 @@ const META_FLUSH_DEBOUNCE_MS = 30_000;
 
 export interface CacheSettings {
   enabled: boolean;
-  /** 前向预取窗口（秒）：从当前播放位置铺到多远；0 = 无限铺满到片尾 */
-  horizonSeconds: number;
   /** 单集缓存上限（字节） */
   maxBytesPerEpisode: number;
   /** 全局缓存上限（字节） */
@@ -33,7 +31,6 @@ export interface CacheSettings {
 
 export const DEFAULT_CACHE_SETTINGS: CacheSettings = {
   enabled: true,
-  horizonSeconds: 300,
   maxBytesPerEpisode: 800 * 1024 * 1024,
   maxTotalBytes: 2 * 1024 * 1024 * 1024,
 };
@@ -48,8 +45,6 @@ export function normalizeCacheSettings(input: unknown): CacheSettings {
   const raw = (input ?? {}) as Partial<CacheSettings>;
   return {
     enabled: raw.enabled !== false,
-    // 0 = 无限（铺满到片尾）；否则 60s ~ 7200s
-    horizonSeconds: raw.horizonSeconds === 0 ? 0 : clamp(raw.horizonSeconds ?? DEFAULT_CACHE_SETTINGS.horizonSeconds, 60, 7200),
     maxBytesPerEpisode: clamp(raw.maxBytesPerEpisode ?? DEFAULT_CACHE_SETTINGS.maxBytesPerEpisode, 50 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
     maxTotalBytes: clamp(raw.maxTotalBytes ?? DEFAULT_CACHE_SETTINGS.maxTotalBytes, 100 * 1024 * 1024, 20 * 1024 * 1024 * 1024),
   };
@@ -120,8 +115,7 @@ export async function readCachedSegment(key: string): Promise<CachedFragment | n
     const cache = await store.open(VIDEO_CACHE_NAME);
     const hit = await cache.match(key);
     if (!hit) return null;
-    const data = await hit.arrayBuffer();
-    const meta = await db.segmentMeta.get(key);
+    const [data, meta] = await Promise.all([hit.arrayBuffer(), db.segmentMeta.get(key).catch(() => undefined)]);
     return { data, costMs: meta?.costMs ?? 150 };
   } catch {
     return null;
@@ -138,12 +132,14 @@ export async function putCachedSegmentResilient(
 ): Promise<CachePutResult> {
   const store = cacheStore();
   if (!store) return 'failed';
-  const bytes = buffer.byteLength;
+  // hls.js 可能立刻把原始 buffer 转移到解复用 worker。
+  const payload = buffer.slice(0);
+  const bytes = payload.byteLength;
   const put = async (): Promise<CachePutResult> => {
     try {
       const cache = await store.open(VIDEO_CACHE_NAME);
       const headers = new Headers({ 'Content-Type': 'video/mp2t', 'Content-Length': String(bytes) });
-      await cache.put(key, new Response(buffer.slice(0), { headers }));
+      await cache.put(key, new Response(payload, { headers }));
       await db.segmentMeta.put({
         key,
         episodeKey: opts.episodeKey,
@@ -162,6 +158,14 @@ export async function putCachedSegmentResilient(
   if (first !== 'quota') return first;
   await enforceQuota(opts.settings);
   return put();
+}
+
+let lastQuotaCheck = 0;
+export function scheduleQuotaCheck(settings: CacheSettings): void {
+  const now = Date.now();
+  if (now - lastQuotaCheck < 15_000) return;
+  lastQuotaCheck = now;
+  void enforceQuota(settings);
 }
 
 /**

@@ -4,21 +4,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Artplayer from 'artplayer';
-import Hls, { type HlsConfig } from 'hls.js';
 import { Icon } from './icon';
 import { useFocusTrap } from './use-focus-trap';
 import type { StreamQuality } from '@/lib/types';
 
-import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
-import { createHlsLoader } from '@/lib/hls-loader';
-import {
-  getVideoPrefetcher,
-  getNextEpisodePrefetcher,
-} from '@/lib/video-prefetcher';
+import { createVodPlayback, vodMediaType } from '@/lib/vod-playback';
+import { prewarmNextEpisode, shouldPrewarmNext } from '@/lib/video-prefetcher';
 import { attachVolumeBoost, type VolumeBoostHandle } from '@/lib/volume-boost';
 import { CONTROL_SHOW_CLASS, syncMiniProgressBar } from '@/lib/mini-progress-bar';
-import { loadCacheSettings } from '@/lib/video-cache';
-import { formatTime } from '@/lib/utils';
+import { cn, formatTime } from '@/lib/utils';
 import { prefersTouchPointer } from '@/lib/touch-pointer';
 import { attachMobileFullscreen, attachTouchControlHide } from '@/lib/mobile-fullscreen';
 import { attachMobilePlayer, type GestureHud } from '@/lib/mobile-player';
@@ -48,7 +42,7 @@ const round1 = (v: number) => Math.round(v * 10) / 10;
  * 保留：广告分片过滤、自动连播回调、进度回调、快捷键、手机手势播放、错误恢复。
  * 移除：DOM 手工操作、watch.html 跳转链、localStorage 状态总线。
  *
- * 关键设计：ArtPlayer 实例只在挂载时创建一次，换集（url 变化）只「切换 HLS 源」
+ * 关键设计：ArtPlayer 实例只在挂载时创建一次，换集（url 变化）只切换媒体源
  * 而不销毁重建。否则在「网页全屏（页面全屏）」下整实例重建会丢失全屏上下文、
  * 重建 <video> 元素，触发「黑屏有声」的渲染竞态。
  */
@@ -57,6 +51,7 @@ const round1 = (v: number) => Math.round(v * 10) / 10;
 export interface PlayerSkipApi {
   getCurrentTime(): number;
   getDuration(): number;
+  getFullscreenHost(): HTMLElement | null;
   /** 跳转到指定位置（「试跳」/标记片段起点用） */
   seek(seconds: number): void;
   /** 暂停播放：记录标记前先定格，避免点击到读取之间视频继续走 */
@@ -99,9 +94,9 @@ interface PlayerShellProps {
   onPlayerApi?: (api: PlayerSkipApi | null) => void;
   /** 快捷键（Shift+I/O/S/E）记录片段时回调，由父级做校验与写入 */
   onRecordSegment?: (segment: SkipSegment) => void;
-  /** 剧集标识 `${source}:${vodId}:${episodeIndex}`（片段缓存按集淘汰的分组键） */
+  /** 剧集与线路标识，用于分片缓存和本地播放记录 */
   episodeKey?: string;
-  /** 下一集 m3u8 地址：当前集预取完成后预热下一集前 7 分钟 */
+  /** 当前播放有余量时预热下一集的开头 */
   nextUrl?: string;
   nextEpisodeKey?: string;
   /** 进度恢复：优先 URL position，其次查询该回调（返回 0 表示无记录） */
@@ -158,7 +153,10 @@ export function PlayerShell({
   const containerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const artRef = useRef<any>(null);
-  const hlsRef = useRef<Hls | null>(null);
+  const playerSession = useRef<ReturnType<typeof createVodPlayback> | null>(null);
+  const warmup = useRef<AbortController | null>(null);
+  const failedPosition = useRef<number | null>(null);
+  const playbackCallbacks = useRef({ onPause, onTimeUpdate, onEnded });
   const volumeBoostRef = useRef<VolumeBoostHandle | null>(null);
   const [error, setError] = useState('');
   const [hint, setHint] = useState('');
@@ -188,8 +186,9 @@ export function PlayerShell({
     document.addEventListener('keydown', close);
     return () => document.removeEventListener('keydown', close);
   }, [menu]);
-  // 媒体就绪后移除起播占位，自动播放被阻止时仍可看到画面和播放按钮。
+  // 目标视频帧出现后移除起播遮罩。
   const [showPoster, setShowPoster] = useState(true);
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 始终持有最新 props/回调，避免重建播放器
@@ -215,23 +214,9 @@ export function PlayerShell({
     propsRef.current.onQuality?.(streamInfoRef.current);
   };
 
-  // 跨集共享、每次换集重置的播放链路状态
-  // 媒体健康度：音频轨可播不代表视频轨正常（「黑屏但有声」的假死态）。
-  // 仅当有分片真正进入 MSE buffer 后才视为恢复，错误遮罩才能被清除。
-  const mediaHealthyRef = useRef(true);
   const playbackStartedRef = useRef(false);
-  // 起播阶段的 video 元素级错误允许自愈重试一次（重建 hls/MSE）
-  const videoErrorRetryUsedRef = useRef(false);
-  // 进度恢复每集只执行一次（MANIFEST_PARSED 可能因代理回退再次触发）
   const restoredRef = useRef(false);
-  // 某些 HLS 源在 MANIFEST_PARSED 时 duration 仍未就绪，延迟到媒体元数据可用后恢复
-  const restoreCleanupRef = useRef<(() => void) | null>(null);
-  // timeupdate 续跑预取的游标：必须按集清零，否则会沿用上一集的时间戳推迟首次续跑
-  const lastPrefetchEnsureRef = useRef(0);
-  // setupHls 可能改走代理形式，video:error 重试要用最近一次的地址
-  const currentMediaUrlRef = useRef(url);
-  // 本集的恢复策略实例：跨直连/代理两级重建共享计数
-  const recoveryRef = useRef<PlaybackRecovery | null>(null);
+
   // 自然播完标记，卸载时不回写进度（避免覆盖「已看完」记录）
   const endedRef = useRef(false);
   // 跳过片段：每集已处理的片段（按 type:start 去重），换集时重置（见 loadEpisode）
@@ -253,58 +238,23 @@ export function PlayerShell({
     hintTimerRef.current = setTimeout(() => setHint(''), 2500);
   };
 
-  const requestSwitchSource = async (reason: string) => {
-    if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
-    if (artRef.current?.fullscreenWeb) artRef.current.fullscreenWeb = false;
+  const requestSwitchSource = (reason: string) => {
     propsRef.current.onRequestSwitchSource?.(reason);
   };
 
-  // 片段缓存开启时调大 hls.js 自身缓冲，缓冲之外的空窗由预取器补齐
-  const buildHlsConfig = (): Partial<HlsConfig> => {
-    const p = propsRef.current;
-    const cacheSettings = loadCacheSettings();
-    const cacheEnabled = cacheSettings.enabled && !!p.episodeKey;
-    return {
-      debug: false,
-      enableWorker: true,
-      backBufferLength: 90,
-      maxBufferLength: cacheEnabled ? 120 : 30,
-      maxMaxBufferLength: cacheEnabled ? 600 : 60,
-      maxBufferSize: (cacheEnabled ? 90 : 30) * 1000 * 1000,
-      maxBufferHole: 0.5,
-      fragLoadingMaxRetry: 6,
-      fragLoadingRetryDelay: 1000,
-      manifestLoadingMaxRetry: 3,
-      manifestLoadingRetryDelay: 1000,
-      startLevel: -1,
-      abrEwmaDefaultEstimate: 500_000,
-      appendErrorMaxRetry: 5,
-      // 组合 loader：广告过滤（blockAd 随设置）+ 片段缓存命中（cacheEnabled）
-      loader: createHlsLoader(Hls, { blockAd: p.adFilter }) as unknown as HlsConfig['loader'],
-    };
+  const cancelWarmup = () => {
+    warmup.current?.abort();
+    warmup.current = null;
   };
 
-  // 当前集预取（episodeKey 缺省 = 关闭，见 ensure 内部 settings.enabled 判断）
-  const ensurePrefetch = (mediaUrl: string, currentTime: number, horizonSeconds?: number) => {
-    const p = propsRef.current;
-    if (!p.episodeKey) return;
-    getVideoPrefetcher().ensure({
-      m3u8Url: mediaUrl,
-      currentTime,
-      episodeKey: p.episodeKey,
-      horizonSeconds,
-      onProgress: (stats) => {
-        // 当前集预取完成且存在下一集：用独立预取器预热下一集前 7 分钟
-        if (stats.state === 'done' && p.nextUrl && p.nextEpisodeKey) {
-          getNextEpisodePrefetcher().ensure({
-            m3u8Url: p.nextUrl,
-            currentTime: 0,
-            episodeKey: p.nextEpisodeKey,
-            horizonSeconds: 420,
-          });
-        }
-      },
-    });
+  const maybeWarmNext = (video: HTMLVideoElement) => {
+    const { nextUrl, nextEpisodeKey, adFilter } = propsRef.current;
+    if (!nextUrl || !nextEpisodeKey || vodMediaType(nextUrl) === 'file' || warmup.current ||
+        !playbackStartedRef.current || !playerSession.current?.isHls() || !shouldPrewarmNext(video)) return;
+    const controller = new AbortController();
+    warmup.current = controller;
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]);
+    void prewarmNextEpisode(nextUrl, nextEpisodeKey, video.videoHeight, adFilter, signal).catch(() => {});
   };
 
   /** 切换提示状态；值相同直接返回，避免 timeupdate 高频 setState */
@@ -359,7 +309,7 @@ export function PlayerShell({
       return false;
     }
     lastSampleRef.current = seconds;
-    ensurePrefetch(currentMediaUrlRef.current, seconds);
+    cancelWarmup();
     return true;
   };
 
@@ -402,163 +352,66 @@ export function PlayerShell({
       /* 忽略 */
     }
     showHint('已跳过片尾');
-    propsRef.current.onEnded?.();
+    playbackCallbacks.current.onEnded?.();
   };
 
-  /**
-   * 初始化/切换 HLS。allowProxyFallback：直连致命网络错误（CORS/防盗链/分片被拒）时，
-   * 自动改走同源 cookie 鉴权的 /api/proxy 重试一次。
-   * 注意：不销毁 ArtPlayer，只销毁并重建 hls，从而保留网页全屏等播放器状态。
-   */
-  const setupHls = (video: HTMLVideoElement, mediaUrl: string, allowProxyFallback: boolean) => {
-    restoreCleanupRef.current?.();
-    restoreCleanupRef.current = null;
-    hlsRef.current?.destroy();
-    currentMediaUrlRef.current = mediaUrl;
-    const hls = new Hls(buildHlsConfig());
-    hlsRef.current = hls;
-
-    let restoreInFlight = false;
-    const restoreAndStart = async () => {
-      if (restoredRef.current || restoreInFlight) return;
-
-      // MANIFEST_PARSED 早于 loadedmetadata 的 HLS 源很常见；没有有效时长时
-      // 先不消费 restoredRef，等 loadedmetadata/durationchange 后再重试。
-      const duration = artRef.current?.duration || video.duration || 0;
-      if (!Number.isFinite(duration) || duration <= 0) return;
-
-      restoreInFlight = true;
-      try {
-        const saved = (await propsRef.current.getRestorePosition?.()) ?? 0;
-        const currentDuration = artRef.current?.duration || video.duration || duration;
-        let prefetchAnchor = video.currentTime;
-        if (saved > 10 && Number.isFinite(currentDuration) && saved < currentDuration - 2) {
-          if (artRef.current) artRef.current.currentTime = saved;
-          prefetchAnchor = saved;
-          showHint(`已从 ${formatTime(saved)} 继续播放`);
-        }
-        restoredRef.current = true;
-        restoreCleanupRef.current?.();
-        restoreCleanupRef.current = null;
-        ensurePrefetch(mediaUrl, prefetchAnchor);
-        video.play().catch(() => {});
-      } catch {
-        // IndexedDB 读取失败时不阻塞播放，后续事件仍可再次尝试恢复。
-      } finally {
-        restoreInFlight = false;
-      }
-    };
-
-    const restoreEvents = ['loadedmetadata', 'durationchange', 'canplay'] as const;
-    const onRestoreEvent = () => { void restoreAndStart(); };
-    restoreEvents.forEach((event) => video.addEventListener(event, onRestoreEvent));
-    restoreCleanupRef.current = () => {
-      restoreEvents.forEach((event) => video.removeEventListener(event, onRestoreEvent));
-    };
-
-    hls.loadSource(mediaUrl);
-    hls.attachMedia(video);
-
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      recoveryRef.current?.markHealthy();
-      // 进度恢复改由 restoreAndStart 处理：duration 未就绪时不消费标记，挂事件重试
-      void restoreAndStart();
-    });
-    // 播放链路恢复（FRAG_LOADED / MANIFEST_PARSED）：静默窗外清零连续失败计数
-    const samples: { bytes: number; seconds: number }[] = [];
-    hls.on(Hls.Events.FRAG_LOADED, (_evt, data) => {
-      recoveryRef.current?.markHealthy();
-      if (data.frag.type !== 'main' || data.frag.sn === 'initSegment' || !(data.frag.duration > 0)) return;
-      // 最近 12 个实际下载分片的封装字节 / 媒体时长。吞吐率不能当作码率。
-      samples.push({ bytes: data.payload.byteLength, seconds: data.frag.duration });
-      if (samples.length > 12) samples.shift();
-      const level = hls.levels[data.frag.level];
-      reportQuality({
-        bitrate: samples.reduce((n, s) => n + s.bytes * 8, 0) / samples.reduce((n, s) => n + s.seconds, 0),
-        bitrateKind: 'segment',
-        ...(level?.attrs['FRAME-RATE'] ? { frameRate: Number(level.attrs['FRAME-RATE']) } : {}),
-        ...(level?.attrs['VIDEO-RANGE'] ? { videoRange: level.attrs['VIDEO-RANGE'] } : {}),
-      });
-    });
-    hls.on(Hls.Events.BUFFER_CODECS, (_evt, data) => {
-      const codec = data.video?.codec;
-      if (codec) reportQuality({ codec });
-    });
-    // 分片真正进入 MSE buffer 才算媒体恢复：此时视频轨可渲染，错误态可解除
-    hls.on(Hls.Events.FRAG_BUFFERED, () => {
-      mediaHealthyRef.current = true;
-    });
-
-    hls.on(Hls.Events.ERROR, (_evt, data) => {
-      if (!data.fatal) return;
-      const recovery = recoveryRef.current;
-      if (!recovery) return;
-      const decision = recovery.onFatal(data.type, data.details);
-      switch (decision.action) {
-        case 'ignore':
-          break;
-        case 'retry': {
-          // 前两次重试保留直连；达到退避阈值或清单级错误时升级为代理形式
-          // （同源 cookie 鉴权，规避 CORS/防盗链/分片被拒）
-          if (
-            allowProxyFallback &&
-            !mediaUrl.startsWith('/api/proxy') &&
-            (decision.attempt >= 2 || data.details === 'manifestLoadError')
-          ) {
-            showHint('直连失败，改用代理重试...');
-            setupHls(video, `/api/proxy?url=${encodeURIComponent(mediaUrl)}`, false);
-            return;
-          }
-          showHint(`${decision.reason}（第 ${decision.attempt} 次）...`);
-          recovery.schedule(decision.delayMs, () => hls.startLoad());
-          break;
-        }
-        case 'recover-media': {
-          showHint(`${decision.reason}（第 ${decision.attempt} 次）...`);
-          if (decision.swapAudio) hls.swapAudioCodec?.();
-          hls.recoverMediaError();
-          break;
-        }
-        case 'switch-source': {
-          // 覆盖播放开始后的场景：起播失败走 setError 遮罩；
-          // 播放中失败走回调弹换源面板（父级未提供回调时同样 setError）
-          const message = `${describeHlsError(data.type, data.details)}：${decision.reason}`;
-          if (playbackStartedRef.current) {
-            showHint(message);
-            void requestSwitchSource(decision.reason);
-          } else {
-            setError(`视频加载失败，${message}，请尝试其他视频源`);
-          }
-          break;
-        }
-      }
-    });
+  const saveActiveProgress = () => {
+    const art = artRef.current;
+    if (art && !endedRef.current && playbackStartedRef.current) {
+      playbackCallbacks.current.onPause?.(art.currentTime, art.duration);
+    }
   };
 
-  /** 换集：重置每集状态并切换到新 HLS 源（不重建 ArtPlayer）。 */
-  const loadEpisode = (targetUrl: string) => {
-    if (!targetUrl) return;
+  const startMedia = (video: HTMLVideoElement, targetUrl: string, position?: number) => {
+    saveActiveProgress();
+    playerSession.current?.dispose();
+    cancelWarmup();
+    const p = propsRef.current;
+    playbackCallbacks.current = { onTimeUpdate: p.onTimeUpdate, onPause: p.onPause, onEnded: p.onEnded };
     streamInfoRef.current = {};
-    mediaHealthyRef.current = true;
     playbackStartedRef.current = false;
-    videoErrorRetryUsedRef.current = false;
     restoredRef.current = false;
-    lastPrefetchEnsureRef.current = 0;
-    // 跳过片段按集重置：上一集已处理过不意味新一集也处理过
     handledSegmentsRef.current.clear();
     suppressedAutoRef.current.clear();
     lastSampleRef.current = 0;
     endedRef.current = false;
     updateSkipPrompt(null);
     setUndoSkip(null);
-    recoveryRef.current = new PlaybackRecovery();
-    // 换集时清掉上一集的预取窗口，避免带宽被旧集占用
-    getVideoPrefetcher().stop();
+    failedPosition.current = null;
     setError('');
     setShowPoster(true);
-    const art = artRef.current;
-    if (!art) return;
-    setupHls(art.video, targetUrl, true);
+    setAutoplayBlocked(false);
+    playerSession.current = createVodPlayback(video, {
+      url: targetUrl,
+      key: p.episodeKey,
+      adFilter: p.adFilter,
+      restore: () => position ?? p.getRestorePosition?.() ?? 0,
+      onFrame: () => {
+        playbackStartedRef.current = true;
+        restoredRef.current = true;
+        lastSampleRef.current = video.currentTime;
+        setShowPoster(false);
+        setAutoplayBlocked(false);
+      },
+      onAutoplayBlocked: () => setAutoplayBlocked(true),
+      onRestored: seconds => showHint(`已从 ${formatTime(seconds)} 继续播放`),
+      onHint: showHint,
+      onError: (message, started, position, duration) => {
+        cancelWarmup();
+        failedPosition.current = position;
+        setError(message);
+        if (started) {
+          playbackCallbacks.current.onPause?.(position, duration);
+          requestSwitchSource(message);
+        }
+      },
+      onQuality: reportQuality,
+    });
+  };
+
+  const loadEpisode = (targetUrl: string, position?: number) => {
+    const video = artRef.current?.video;
+    if (video && targetUrl) startMedia(video, targetUrl, position);
   };
 
   // —— 创建播放器（仅一次，挂载即创建） ——
@@ -569,17 +422,6 @@ export function PlayerShell({
     // static 保持不自动隐藏，点按后再由 attachTouchControlHide 收起。
     const touchPointer = prefersTouchPointer();
     Artplayer.CONTROL_HIDE_TIME = touchPointer ? TOUCH_CONTROL_HIDE_MS : DESKTOP_CONTROL_HIDE_MS;
-
-    // 初始化每集状态
-    mediaHealthyRef.current = true;
-    playbackStartedRef.current = false;
-    videoErrorRetryUsedRef.current = false;
-    restoredRef.current = false;
-    recoveryRef.current = new PlaybackRecovery();
-    endedRef.current = false;
-    handledSegmentsRef.current.clear();
-    suppressedAutoRef.current.clear();
-    lastSampleRef.current = 0;
 
     let lastSave = 0;
 
@@ -609,9 +451,9 @@ export function PlayerShell({
     const art = new Artplayer({
       container: containerRef.current,
       url: initialUrl,
-      type: 'm3u8',
+      type: 'vod',
       volume: 0.8,
-      autoplay: true,
+      autoplay: false,
       pip: true,
       autoMini: !touchPointer,
       screenshot: true,
@@ -639,6 +481,11 @@ export function PlayerShell({
         { name: 'quick-speed', index: 5, position: 'right', html: speedButton },
         { name: 'episode-menu', index: 6, position: 'right', html: episodeButton },
         ...(touchPointer ? [{ name: 'tools', index: 7, position: 'right' as const, html: toolsButton }] : []),
+        ...(!touchPointer && propsRef.current.onRequestSwitchSource ? [{
+          name: 'switch-source', index: 7, position: 'right' as const,
+          html: '<button type="button" class="watch-control-label" aria-label="换源">换源</button>',
+          click: () => requestSwitchSource(''),
+        }] : []),
         {
           name: 'prev-episode',
           index: 11,
@@ -661,9 +508,7 @@ export function PlayerShell({
         },
       ],
       customType: {
-        m3u8: (video: HTMLVideoElement, mediaUrl: string) => {
-          setupHls(video, mediaUrl, true);
-        },
+        vod: (video: HTMLVideoElement, mediaUrl: string) => startMedia(video, mediaUrl),
       },
     });
     artRef.current = art;
@@ -739,8 +584,14 @@ export function PlayerShell({
 
     // 播放页「记录当前」需要精确时间：不能依赖 5s 节流的 onTimeUpdate
     propsRef.current.onPlayerApi?.({
+      getFullscreenHost: () => {
+        const fullscreen = document.fullscreenElement;
+        if (fullscreen instanceof HTMLElement && fullscreen !== art.video && fullscreen.contains(art.video)) return fullscreen;
+        const host = art.template.$player as HTMLElement;
+        return art.fullscreenWeb || host.classList.contains('is-mobile-fullscreen') ? host : null;
+      },
       getCurrentTime: () => {
-        const current = artRef.current?.currentTime;
+        const current = failedPosition.current ?? artRef.current?.currentTime;
         return typeof current === 'number' && Number.isFinite(current) ? current : 0;
       },
       getDuration: () => {
@@ -778,7 +629,7 @@ export function PlayerShell({
       if (height > 0 && width > 0) reportQuality({ width, height });
     };
     art.on('video:loadedmetadata', reportVideoHeight);
-    art.on('video:canplay', () => { reportVideoHeight(); setShowPoster(false); });
+    art.on('video:canplay', reportVideoHeight);
     // resize 不在 ArtPlayer 的视频事件转发表里，直接挂原生事件
     art.video?.addEventListener('resize', reportVideoHeight);
 
@@ -790,26 +641,6 @@ export function PlayerShell({
       } catch { /* 忽略 */ }
     });
 
-    art.on('video:playing', () => {
-      playbackStartedRef.current = true;
-      setShowPoster(false);
-      // 仅在媒体真正恢复（有分片进入 buffer）后清错误遮罩：
-      // 否则「视频轨挂了、音频轨先播出来」时会清掉遮罩，留下黑屏假死态
-      if (mediaHealthyRef.current) setError('');
-      reportVideoHeight();
-    });
-    art.on('video:error', () => {
-      mediaHealthyRef.current = false;
-      // 起播阶段的 video 元素级错误（MSE/解码偶发失败）：重建一次播放链路自愈，
-      // 而不是直接钉死错误遮罩——重建后视频轨重新 append，黑屏有声即可解除
-      if (!playbackStartedRef.current && !videoErrorRetryUsedRef.current) {
-        videoErrorRetryUsedRef.current = true;
-        showHint('播放异常，正在重试...');
-        setupHls(art.video, currentMediaUrlRef.current, true);
-        return;
-      }
-      setError('视频播放失败，请尝试其他视频源');
-    });
     art.on('video:timeupdate', () => {
       const loop = abRef.current;
       if (loop.a != null && loop.b != null && loop.b > loop.a && art.currentTime >= loop.b) {
@@ -817,18 +648,11 @@ export function PlayerShell({
         return;
       }
       const now = Date.now();
-      if (now - lastSave > 5000) {
+      if (playbackStartedRef.current && now - lastSave > 5000) {
         lastSave = now;
-        propsRef.current.onTimeUpdate?.(art.currentTime, art.duration);
+        playbackCallbacks.current.onTimeUpdate?.(art.currentTime, art.duration);
       }
-      // 每 30s 续跑一次前向预取窗口（ensure 幂等，窗口未覆盖足够余量才会重建）
-      if (now - lastPrefetchEnsureRef.current > 30_000) {
-        lastPrefetchEnsureRef.current = now;
-        // 用 currentMediaUrlRef（代理回退后的实际地址）：否则预取的 key 与
-        // loader 读取的 key 不一致，缓存永不命中且直连 fetch 白耗流量
-        ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
-      }
-
+      maybeWarmNext(art.video);
       // —— 跳过片段判定 ——
       const p = propsRef.current;
       const current = art.currentTime;
@@ -878,7 +702,6 @@ export function PlayerShell({
       updateSkipPrompt(prompt);
     });
     art.on('video:seeked', () => {
-      ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
       // seek 是用户主动行为：拉平采样基准，避免下一拍被误判为「连续越过片尾」。
       // 暂停中 seek 不会触发 timeupdate，这里也同步刷新按钮的显隐。
       const current = art.currentTime;
@@ -890,26 +713,17 @@ export function PlayerShell({
       updateSkipPrompt(prompt);
     });
     art.on('video:pause', () => {
-      // 跳过片尾会主动 pause：此时已按「看完」处理，不能再把片尾位置写回进度
-      if (!endedRef.current) propsRef.current.onPause?.(art.currentTime, art.duration);
-      // 暂停 = 预取黄金窗口：解除限速并无限铺满整集（用户主动行为，带宽占用可接受）
-      // waiting 触发的限速在此解除，否则黄金窗口会被 500ms 轮询冻结
-      getVideoPrefetcher().setThrottled(false);
-      ensurePrefetch(currentMediaUrlRef.current, art.currentTime, 0);
+      saveActiveProgress();
+      cancelWarmup();
     });
-    art.on('video:waiting', () => {
-      // 卡顿：预取临时让出带宽给播放
-      getVideoPrefetcher().setThrottled(true);
-    });
-    art.on('video:playing', () => {
-      getVideoPrefetcher().setThrottled(false);
-    });
+    art.on('video:seeking', cancelWarmup);
+    art.on('video:waiting', cancelWarmup);
     art.on('video:ended', () => {
       // finishBySkip 已经手动走过结束链路：这里不能重复触发 onEnded
       if (endedRef.current) return;
       endedRef.current = true;
       updateSkipPrompt(null);
-      propsRef.current.onEnded?.();
+      playbackCallbacks.current.onEnded?.();
     });
 
     // —— 键盘快捷键（旧版 hotkey:false + 自定义逻辑的移植） ——
@@ -1017,7 +831,7 @@ export function PlayerShell({
     // 卸载与页面隐藏时保存进度
     const saveOnHide = () => {
       if (document.visibilityState === 'hidden' && !endedRef.current) {
-        propsRef.current.onPause?.(art.currentTime, art.duration);
+        saveActiveProgress();
       }
     };
     document.addEventListener('visibilitychange', saveOnHide);
@@ -1025,11 +839,7 @@ export function PlayerShell({
     return () => {
       // 卸载前刷一次最终进度，避免丢失最后几秒。
       // 已自然播完的集数不回写，避免覆盖 onEnded 里清除的「已看完」记录
-      if (!endedRef.current) {
-        try {
-          propsRef.current.onPause?.(art.currentTime, art.duration);
-        } catch { /* 忽略 */ }
-      }
+      saveActiveProgress();
       document.removeEventListener('keydown', shortcuts);
       document.removeEventListener('visibilitychange', saveOnHide);
       volumeBoostRef.current?.dispose();
@@ -1040,18 +850,15 @@ export function PlayerShell({
       el?.removeEventListener('mousemove', showControlsOnPointerMove);
       el?.removeEventListener('mouseleave', hideControlsOnMouseLeave);
       if (controlHideTimer) clearTimeout(controlHideTimer);
-      restoreCleanupRef.current?.();
-      restoreCleanupRef.current = null;
       Artplayer.CONTROL_HIDE_TIME = ART_DEFAULT_CONTROL_HIDE_MS;
       if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current);
       mobileFullscreen?.dispose();
       releaseTouchControls?.();
       releaseGestures();
       releaseScrub();
-      hlsRef.current?.destroy();
-      hlsRef.current = null;
-      recoveryRef.current?.dispose();
-      getVideoPrefetcher().stop();
+      playerSession.current?.dispose();
+      playerSession.current = null;
+      cancelWarmup();
       // 播放页可能仍持有读取接口：销毁前显式置空，避免「记录当前」读到已销毁实例
       propsRef.current.onPlayerApi?.(null);
       art.destroy();
@@ -1121,7 +928,7 @@ export function PlayerShell({
     renderSkipMarks();
   }, [skipMark]);
 
-  // —— 换集：仅切换 HLS 源，不重建播放器（保留网页全屏等状态） ——
+  // —— 复用同一个视频元素切集，保留网页全屏等状态 ——
   const firstUrlRef = useRef(true);
   useEffect(() => {
     // 挂载时的首次由创建 effect 的 customType 触发，跳过避免重复加载
@@ -1130,16 +937,13 @@ export function PlayerShell({
     setAbLoop({ a: null, b: null });
     loadEpisode(url);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url]);
+  }, [url, episodeKey]);
 
   // —— 广告过滤开关变化：重建 HLS loader（无需重建整个播放器） ——
   const firstAdFilterRef = useRef(true);
   useEffect(() => {
     if (firstAdFilterRef.current) { firstAdFilterRef.current = false; return; }
-    if (artRef.current && hlsRef.current) {
-      // 用当前实际媒体地址：代理回退生效时切广告过滤不应跳回直连形式
-      loadEpisode(currentMediaUrlRef.current || propsRef.current.url);
-    }
+    if (artRef.current && playerSession.current) loadEpisode(propsRef.current.url, artRef.current.currentTime);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adFilter]);
 
@@ -1278,6 +1082,7 @@ export function PlayerShell({
                       <button type="button" onClick={takeScreenshot}>截图</button>
                       <button type="button" onClick={() => { void togglePip(); }}>画中画</button>
                       <button type="button" onClick={toggleLock}>锁屏</button>
+                      {onRequestSwitchSource && <button type="button" onClick={() => { setMenu(null); requestSwitchSource(''); }}>换源</button>}
                     </div>
                   </div>
                 ) : (
@@ -1301,12 +1106,16 @@ export function PlayerShell({
             coach="双击左侧快退、右侧快进。左右滑调整进度，左侧上下滑调亮度，右侧上下滑调音量，长按临时 3 倍速。"
             onToggleLock={toggleLock}
           />
-      {showPoster && !error && (
-        <div className="absolute inset-0 bg-[#050a12] flex flex-col items-center justify-center gap-3 pointer-events-none" role="status">
-          <div className="w-8 h-8 rounded-full border-2 border-slate-700 border-t-sky-400 animate-spin" />
-          <p className="text-slate-200 text-sm">正在准备播放</p>
+      {showPoster && !error && overlayHost && createPortal(
+        <div className={cn('absolute inset-0 z-20 bg-[#050a12] flex flex-col items-center justify-center gap-3', !autoplayBlocked && 'pointer-events-none')} role="status">
+          {autoplayBlocked ? (
+            <button type="button" className="btn-primary" onClick={() => { void artRef.current?.video.play().catch(() => {}); }}>开始播放</button>
+          ) : (
+            <><div className="w-8 h-8 rounded-full border-2 border-slate-700 border-t-sky-400 animate-spin" />
+            <p className="text-slate-200 text-sm">正在准备播放</p></>
+          )}
           <p className="text-slate-400 text-xs">{sourceName || '正在连接播放线路'}</p>
-        </div>
+        </div>, overlayHost
       )}
       {!error && skipPrompt && (
         <button
@@ -1333,15 +1142,15 @@ export function PlayerShell({
               : '跳过中段'}
         </button>
       )}
-      {error && (
+      {error && overlayHost && createPortal(
         <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-4 bg-black/90 px-6 text-center">
           <Icon name="alert" className="w-8 h-8 text-slate-400" />
           <div><p className="text-white font-medium mb-2">这条线路暂时无法播放</p><p className="text-slate-400 text-xs">{error}</p></div>
           <div className="flex gap-3">
-            <button className="btn-ghost text-xs" onClick={() => loadEpisode(propsRef.current.url)}>重试播放</button>
-            {onRequestSwitchSource && <button className="btn-primary text-xs" onClick={() => { void requestSwitchSource(error); }}>切换线路</button>}
+            <button className="btn-ghost text-xs" onClick={() => loadEpisode(propsRef.current.url, failedPosition.current || undefined)}>重试播放</button>
+            {onRequestSwitchSource && <button className="btn-primary text-xs" onClick={() => requestSwitchSource(error)}>切换线路</button>}
           </div>
-        </div>
+        </div>, overlayHost
       )}
       {(hint || undoSkip) && (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-sm text-white animate-fade-in">

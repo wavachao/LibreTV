@@ -654,7 +654,7 @@ function VideoCachePanel() {
     <div className="space-y-3 pt-3 mt-3 border-t border-line">
       <ToggleRow
         label="片段本地缓存"
-        description="暂停或观看时把后续分片缓存到浏览器本地，二次播放与断网卡顿时直接命中（存储于本机，不计入配置导出）"
+        description="本机复用已经播放加载的 HLS 分片。接近片尾且缓冲充足时，提前加载下一集开头"
         checked={enabled}
         onChange={(v) => {
           const next = saveCacheSettings({ enabled: v });

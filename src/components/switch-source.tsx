@@ -2,9 +2,10 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { api } from '@/lib/client-api';
-import type { SourceConfig, SearchResultItem } from '@/lib/types';
+import { useQueryClient } from '@tanstack/react-query';
+import { api, VIDEO_DETAIL_STALE_MS, videoDetailOptions } from '@/lib/client-api';
+import type { SourceConfig, SearchResultItem, VideoDetail } from '@/lib/types';
+import { playbackKey, playbackScore, readPlaybackHealth, type PlaybackHealth } from '@/lib/playback-health';
 import { buildWatchUrl, cn } from '@/lib/utils';
 import { useAppStore, resolveSource } from '@/lib/store';
 import { qualityKey, qualityLabel, streamQualityText } from '@/lib/quality';
@@ -16,17 +17,14 @@ import { useFocusTrap } from './use-focus-trap';
 import { QualityBadge } from './quality-badge';
 import { useQualityProbe } from './use-quality-probe';
 
-/**
- * 换源面板：跨源按标题搜索 → 匹配同名/同前缀资源 → 并发测速（详情接口耗时）→ 按速度排序展示。
- * 切换时保留当前集数索引（旧版 switchToResource 逻辑的去 DOM 化重写）。
- */
-
 interface Candidate {
   source: SourceConfig;
   result: SearchResultItem;
   ms?: number;
   ok?: boolean;
   episodes?: number;
+  detail?: VideoDetail;
+  health?: PlaybackHealth;
   /** 测速失败原因：失败源点开后至少能知道是超时、还是源站直接拒绝 */
   error?: string;
 }
@@ -37,21 +35,33 @@ const candidateKey = (c: Candidate) => `${c.source.key}_${c.result.vodId}`;
 const isCurrentCandidate = (c: Candidate, sourceKey: string, vodId: string) =>
   c.source.key === sourceKey && String(c.result.vodId) === String(vodId);
 
+function sourceEpisode(detail: VideoDetail | undefined, index: number) {
+  if (!detail) return undefined;
+  const line = detail.playLines?.findIndex(entry => entry.episodes[index]) ?? -1;
+  if (line >= 0) return { line, url: detail.playLines![line].episodes[index] };
+  const url = detail.episodes[index];
+  if (!detail.playLines?.length && url) return { line: 0, url };
+}
+
 export function SwitchSourceModal({
   currentTitle,
+  currentYear,
   currentSourceKey,
   currentVodId,
   currentIndex,
+  getPosition,
   onClose,
 }: {
   currentTitle: string;
+  currentYear?: string;
   currentSourceKey: string;
   currentVodId: string;
   currentIndex: number;
+  getPosition: () => number;
   onClose: () => void;
 }) {
   const store = useAppStore();
-  const router = useRouter();
+  const queryClient = useQueryClient();
   const { toast } = useToast();
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [phase, setPhase] = useState<'searching' | 'testing' | 'done'>('searching');
@@ -71,17 +81,18 @@ export function SwitchSourceModal({
   // 打开时把焦点移入弹窗、Tab 圈闭在弹窗内、关闭后归还焦点
   useFocusTrap(true, panelRef);
 
+  const { selectedKeys, customAPIs, envSources, yellowFilter } = store;
   const sources = useMemo(() => {
     // selectedKeys 可能含历史残留的重复 key：按 key 去重，避免同源重复搜索/测速与 React key 撞车
     const seen = new Set<string>();
-    return store.selectedKeys
-      .map((key) => resolveSource(store, key))
+    return selectedKeys
+      .map((key) => resolveSource({ customAPIs, envSources }, key))
       .filter((s): s is SourceConfig => {
         if (!s || seen.has(s.key)) return false;
         seen.add(s.key);
         return true;
       });
-  }, [store]);
+  }, [selectedKeys, customAPIs, envSources]);
 
   useEffect(() => {
     // 弹窗打开期间锁定背景滚动；Esc 关闭（与其它弹窗一致）
@@ -101,82 +112,86 @@ export function SwitchSourceModal({
   }, [onClose]);
 
   useEffect(() => {
-    // 关闭弹窗时中止在途请求：否则 N 个源的搜索 + N 个详情测速会继续占用网络与后端
     const controller = new AbortController();
-    let cancelled = false;
+    const { signal } = controller;
+    const seen = new Set<string>();
+    const slots = Array.from({ length: 4 }, () => Promise.resolve());
+    let nextSlot = 0;
+    setCandidates([]);
+    setPhase('searching');
+    const inspect = (source: SourceConfig, results: SearchResultItem[]) => {
+      if (signal.aborted || seen.has(source.key)) return;
+      const title = currentTitle.normalize('NFKC').trim();
+      if (!title) return;
+      const sameYear = results.filter(result => !currentYear || !result.year || result.year === currentYear);
+      const nameOf = (result: SearchResultItem) => result.name.normalize('NFKC').trim();
+      const result = sameYear.find(entry => nameOf(entry) === title) ?? sameYear.find(entry => nameOf(entry).startsWith(title));
+      if (!result) return;
+      seen.add(source.key);
+      const health = readPlaybackHealth(playbackKey(source.key, result.vodId, 0, currentIndex));
+      const candidate: Candidate = { source, result, health };
+      setPhase('testing');
+      setCandidates(prev => [...prev, candidate]);
+      const slot = nextSlot++ % slots.length;
+      slots[slot] = slots[slot].then(async () => {
+        if (signal.aborted) return;
+        const options = videoDetailOptions(result.vodId, source);
+        const cache = queryClient.getQueryState<VideoDetail>(options.queryKey);
+        const fresh = cache?.data && Date.now() - cache.dataUpdatedAt < VIDEO_DETAIL_STALE_MS;
+        const response = fresh
+          ? { ok: true, detail: cache.data, ms: undefined, error: undefined }
+          : await api.detailSpeed(result.vodId, source, AbortSignal.any([signal, AbortSignal.timeout(5500)]));
+        if (signal.aborted) return;
+        if (response.detail && !fresh) queryClient.setQueryData(options.queryKey, response.detail);
+        const episode = sourceEpisode(response.detail, currentIndex);
+        const health = episode ? readPlaybackHealth(playbackKey(source.key, result.vodId, episode.line, currentIndex)) : candidate.health;
+        setCandidates(prev => prev.map(entry => candidateKey(entry) === candidateKey(candidate)
+          ? { ...entry, ...response, health, episodes: response.detail?.episodes.length } : entry));
+      });
+    };
 
-    (async () => {
-      // 1) 并行搜索所有选中源
-      setPhase('searching');
+    void (async () => {
       try {
-        const { list } = await api.search(currentTitle, sources, store.yellowFilter, { signal: controller.signal });
-        if (cancelled) return;
-
-        // 匹配口径：优先完全同名，其次名称以标题开头（兼容「小偷 HD」「小偷[电影解说]」这类修饰名）。
-        // 都没有则不展示该源——不再兜底取搜索第一条，避免把搜到的其他影片（如搜「小偷」
-        // 命中的《宝贝 小偷与大盗》）误当成换源目标。
-        const title = currentTitle.trim();
-        const matched: Candidate[] = [];
-        for (const s of sources) {
-          const hits = list.filter((r) => r.sourceKey === s.key);
-          const exact =
-            hits.find((r) => (r.name || '').trim() === title) ??
-            hits.find((r) => (r.name || '').trim().startsWith(title));
-          if (exact) matched.push({ source: s, result: exact });
-        }
-
-        // 2) 并发测速（详情接口耗时）并获取集数
-        setPhase('testing');
-        await Promise.all(
-          matched.map(async (c) => {
-            const r = await api.detailSpeed(c.result.vodId, c.source, controller.signal);
-            if (cancelled) return;
-            c.ok = r.ok;
-            c.ms = r.ms;
-            c.episodes = r.detail?.episodes.length ?? 0;
-            c.error = r.ok ? undefined : r.error;
-          })
-        );
-        if (cancelled) return;
-        setCandidates(matched);
-        setPhase('done');
-      } catch (err) {
-        // 主动中止不算失败，不提示
-        const aborted = err instanceof DOMException && err.name === 'AbortError';
-        if (!cancelled && !aborted) {
-          toast(err instanceof Error ? err.message : '换源搜索失败', 'error');
-          setPhase('done');
-        }
+        const { list } = await api.search(currentTitle, sources, yellowFilter, {
+          signal,
+          onSource: outcome => {
+            const source = sources.find(entry => entry.key === outcome.sourceKey);
+            if (source && outcome.ok) inspect(source, outcome.list);
+          },
+        });
+        for (const source of sources) inspect(source, list.filter(result => result.sourceKey === source.key));
+      } catch {
+        if (!signal.aborted && !seen.size) toast('换源搜索失败', 'error');
       }
+      await Promise.allSettled(slots);
+      if (!signal.aborted) setPhase('done');
     })();
 
     return () => {
-      cancelled = true;
       controller.abort();
-      // 换片重搜 / 关闭面板时，单独发起的重测也要跟着停
       retestAbortRef.current?.abort();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentTitle, store.yellowFilter]);
+  }, [currentTitle, currentYear, currentIndex, sources, yellowFilter, queryClient, toast]);
 
-  const { qualities, probing, progress, probe, retry } = useQualityProbe(sources);
-
-  // 测速完成后补探画质：用户正是在这里比较来源，「快」和「清楚」要能一起看。
-  // 只探测速成功的候选——详情接口都打不通的源，再花 8s 探 m3u8 没有意义。
+  const { qualities, probing, progress, probeQueued, retry } = useQualityProbe(sources);
   useEffect(() => {
-    if (phase !== 'done') return;
-    const targets = candidates.filter((c) => c.ok).map((c) => c.result);
-    if (targets.length > 0) probe(targets);
-  }, [phase, candidates, probe]);
+    const targets = candidates.filter(c => c.ok).map(c => c.result);
+    if (targets.length) probeQueued(targets);
+  }, [candidates, probeQueued]);
 
   const sorted = useMemo(() => [...candidates].sort((a, b) => {
     const aCurrent = isCurrentCandidate(a, currentSourceKey, currentVodId);
     const bCurrent = isCurrentCandidate(b, currentSourceKey, currentVodId);
     if (aCurrent !== bCurrent) return aCurrent ? -1 : 1;
-    const msA = a.ok ? a.ms ?? 99_999 : 99_999;
-    const msB = b.ok ? b.ms ?? 99_999 : 99_999;
-    return msA - msB;
-  }), [candidates, currentSourceKey, currentVodId]);
+    const aReady = Boolean(sourceEpisode(a.detail, currentIndex));
+    const bReady = Boolean(sourceEpisode(b.detail, currentIndex));
+    if (aReady !== bReady) return aReady ? -1 : 1;
+    if (Boolean(a.health?.failed) !== Boolean(b.health?.failed)) return a.health?.failed ? 1 : -1;
+    const aScore = playbackScore(a.health);
+    const bScore = playbackScore(b.health);
+    if (aScore !== bScore) return aScore < bScore ? -1 : 1;
+    return (a.ms ?? 99_999) - (b.ms ?? 99_999);
+  }), [candidates, currentIndex, currentSourceKey, currentVodId]);
 
   /**
    * 面板展示的源：优先用户点过的那个；还没点过时先落到「第一个可切换的源」——
@@ -184,7 +199,7 @@ export function SwitchSourceModal({
    */
   const selected =
     sorted.find((c) => candidateKey(c) === selectedKey) ??
-    sorted.find((c) => !isCurrentCandidate(c, currentSourceKey, currentVodId) && c.ok) ??
+    sorted.find((c) => !isCurrentCandidate(c, currentSourceKey, currentVodId) && sourceEpisode(c.detail, currentIndex)) ??
     sorted[0];
   const selectedCandidateKey = selected ? candidateKey(selected) : '';
 
@@ -222,16 +237,12 @@ export function SwitchSourceModal({
     const controller = new AbortController();
     retestAbortRef.current = controller;
     try {
-      const r = await api.detailSpeed(c.result.vodId, c.source, controller.signal);
+      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(5500)]);
+      const r = await api.detailSpeed(c.result.vodId, c.source, signal);
       if (controller.signal.aborted) return;
-      setCandidates((prev) =>
-        prev.map((x) =>
-          candidateKey(x) === key
-            ? { ...x, ok: r.ok, ms: r.ms, episodes: r.detail?.episodes.length ?? 0, error: r.ok ? undefined : r.error }
-            : x
-        )
-      );
-      // 重测成功说明源只是刚才抖了一下：强制补一次画质，否则会撞上失败冷却（2 分钟内不再探）
+      if (r.detail) queryClient.setQueryData(videoDetailOptions(c.result.vodId, c.source).queryKey, r.detail);
+      setCandidates(prev => prev.map(x => candidateKey(x) === key
+        ? { ...x, ...r, episodes: r.detail?.episodes.length } : x));
       if (r.ok) retry([c.result]);
     } finally {
       if (retestAbortRef.current === controller) {
@@ -242,22 +253,23 @@ export function SwitchSourceModal({
   };
 
   const switchTo = (c: Candidate) => {
-    if (!c.episodes) {
-      toast('该源无可用播放资源', 'warning');
-      return;
-    }
-    const targetIndex = currentIndex < c.episodes ? currentIndex : 0;
-    onClose(); // 先关闭面板，避免路由参数变化后弹窗残留旧数据
-    router.push(
-      buildWatchUrl({
-        sourceKey: c.source.key,
-        vodId: c.result.vodId,
-        index: targetIndex,
-        title: c.result.name || currentTitle,
-        sourceUrl: c.source.url,
-        detail: c.source.detail,
-      })
-    );
+    const episode = sourceEpisode(c.detail, currentIndex);
+    if (!episode || !c.detail) return;
+    const title = c.detail.videoInfo.title || c.result.name;
+    const position = title.normalize('NFKC').trim() === currentTitle.normalize('NFKC').trim() ? getPosition() : undefined;
+    queryClient.setQueryData(videoDetailOptions(c.result.vodId, c.source).queryKey, c.detail);
+    onClose();
+    window.history.pushState(null, '', buildWatchUrl({
+      sourceKey: c.source.key,
+      vodId: c.result.vodId,
+      index: currentIndex,
+      title,
+      line: episode.line,
+      episodeUrl: episode.url,
+      position,
+      sourceUrl: c.source.url,
+      detail: c.source.detail,
+    }));
   };
 
   return (
@@ -289,7 +301,7 @@ export function SwitchSourceModal({
                   ? '正在检查详情接口...'
                   : `共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.ok).length} 个详情响应正常`}
             </p>
-            {phase === 'done' && progress.total > 0 && (
+            {progress.total > 0 && (
               <p className="text-xs text-faint tabular-nums mt-0.5">
                 {progress.done < progress.total
                   ? `画质探测中 ${progress.done}/${progress.total}`
@@ -309,7 +321,7 @@ export function SwitchSourceModal({
 
         {/* 内容区独占剩余高度并自己滚动：标题与拖拽条始终可见，不随内容滚走 */}
         <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden scrollbar-thin">
-        {phase !== 'done' ? (
+        {sorted.length === 0 && phase !== 'done' ? (
           <LoadingState label={phase === 'searching' ? '搜索各资源中...' : '检查详情接口中...'} />
         ) : sorted.length === 0 ? (
           <EmptyState variant="plain" title="其他点播源未找到同名资源" />
@@ -352,10 +364,10 @@ export function SwitchSourceModal({
                             'w-1.5 h-1.5 rounded-full shrink-0',
                             (c.ms ?? 0) > 2000 ? 'bg-warning-solid' : 'bg-success-solid'
                           )}
-                          title={`${c.ms}ms`}
+                          title={c.ms === undefined ? '详情已缓存' : `${c.ms}ms`}
                         />
                       ) : (
-                        <span className="text-[10px] text-danger">失败</span>
+                        <span className="text-[10px] text-faint">{c.ok === false ? '失败' : '检查中'}</span>
                       )}
                     </button>
                   );
@@ -411,10 +423,10 @@ export function SwitchSourceModal({
                         <div
                           className={cn(
                             'text-xs font-medium tabular-nums',
-                            !c.ok ? 'text-danger' : (c.ms ?? 0) > 2000 ? 'text-warning' : 'text-success'
+                            c.ok === false ? 'text-danger' : (c.ms ?? 0) > 2000 ? 'text-warning' : 'text-success'
                           )}
                         >
-                          {c.ok ? `${c.ms}ms` : '请求失败'}
+                          {c.ok === undefined ? '检查中' : c.ok ? (c.ms === undefined ? '已缓存' : `${c.ms}ms`) : '请求失败'}
                         </div>
                       </div>
                       <div className="rounded-md bg-chip px-2 py-1.5">
@@ -425,20 +437,21 @@ export function SwitchSourceModal({
                       </div>
                     </div>
                     <p className="text-xs text-muted mt-2 break-words">{qualities[qKey] && streamQualityText(qualities[qKey])}</p>
-                    <p className="text-[10px] text-faint mt-1">接口响应时间不代表画质或播放速度；码率与编码以媒体探测和实际播放为准。</p>
+                    {c.health && <p className="text-xs text-faint mt-1">
+                      {c.health.failed ? '上次播放失败' : `实播首帧 ${((c.health.firstFrameMs ?? 0) / 1000).toFixed(1)} 秒 · 缓冲 ${(c.health.stalledMs / 1000).toFixed(1)} 秒`}
+                    </p>}
                     <div className="mt-2.5 flex flex-wrap items-center gap-2">
                       {isCurrent ? (
                         <span className="text-xs text-accent">当前正在播放</span>
                       ) : (
                         <>
-                          <button type="button" className="btn-primary btn-sm" disabled={!c.episodes} onClick={() => switchTo(c)}>
+                          <button type="button" className="btn-primary btn-sm" disabled={!sourceEpisode(c.detail, currentIndex)} onClick={() => switchTo(c)}>
                             切换到此源
                           </button>
-                          {/* 测速失败但拿得到集数：允许点。详情接口偶发超时很常见，别把能播的源挡在外面 */}
-                          {!c.ok && !!c.episodes && <span className="text-xs text-warning">详情请求未通过，仍可尝试</span>}
+                          {c.ok && !sourceEpisode(c.detail, currentIndex) && <span className="text-xs text-warning">没有当前集</span>}
                         </>
                       )}
-                      {!c.ok && (
+                      {c.ok === false && (
                         <button
                           type="button"
                           className="btn-ghost btn-sm"
@@ -449,7 +462,7 @@ export function SwitchSourceModal({
                         </button>
                       )}
                     </div>
-                    {!c.ok && c.error && (
+                    {c.ok === false && c.error && (
                       <p className="mt-1 text-[11px] text-faint line-clamp-1" title={c.error}>
                         {c.error}
                       </p>

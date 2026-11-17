@@ -97,8 +97,10 @@ export function buildWatchUrl(params: {
   sourceKey: string;
   vodId?: string;
   index?: number;
+  line?: number;
   title?: string;
   episodeUrl?: string;
+  position?: number;
   sourceUrl?: string;
   detail?: string;
 }): string {
@@ -106,8 +108,12 @@ export function buildWatchUrl(params: {
   sp.set('source', params.sourceKey);
   if (params.vodId) sp.set('id', params.vodId);
   if (typeof params.index === 'number') sp.set('index', String(params.index));
+  if (params.line && params.line > 0) sp.set('line', String(params.line));
   if (params.title) sp.set('title', params.title);
   if (params.episodeUrl) sp.set('url', params.episodeUrl);
+  if (params.position && Number.isFinite(params.position) && params.position > 0) {
+    sp.set('position', String(Math.floor(params.position * 10) / 10));
+  }
   if (params.sourceUrl) sp.set('sourceUrl', params.sourceUrl);
   if (params.detail) sp.set('detail', params.detail);
   return `/watch?${sp.toString()}`;

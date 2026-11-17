@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { api } from '@/lib/client-api';
-import type { SearchResultItem, VideoDetail } from '@/lib/types';
+import { useQuery } from '@tanstack/react-query';
+import { videoDetailOptions } from '@/lib/client-api';
+import type { SearchResultItem } from '@/lib/types';
 import { buildWatchUrl } from '@/lib/utils';
 import { formatRemarks } from '@/lib/remarks';
 import { SmartImage } from './smart-image';
@@ -25,12 +26,8 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
   const store = useAppStore();
   const router = useRouter();
   const { toast } = useToast();
-  const [detail, setDetail] = useState<VideoDetail | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
   const [reversed, setReversed] = useState(false);
   const [posterFailed, setPosterFailed] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
   // 打开时把焦点移入弹窗、Tab 圈闭在弹窗内、关闭后归还焦点
@@ -48,36 +45,17 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
     };
   }, [item]);
 
+  const source = item ? resolveSource(store, item.sourceKey, { url: item.sourceUrl, name: item.sourceName }) : undefined;
+  const detailQuery = useQuery(videoDetailOptions(item?.vodId ?? '', source));
+  const detail = detailQuery.data;
+  const loading = detailQuery.isLoading;
+  const error = !source ? '点播源配置不存在（可能已被删除），请在设置中重新添加' : detailQuery.error?.message;
+
   useEffect(() => {
-    if (!item) {
-      setDetail(null);
-      setError('');
-      return;
-    }
-    const source = resolveSource(store, item.sourceKey, {
-      url: item.sourceUrl,
-      name: item.sourceName,
-    });
-    if (!source) {
-      setError('点播源配置不存在（可能已被删除），请在设置中重新添加');
-      return;
-    }
-    setLoading(true);
-    setError('');
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    api
-      .detail(item.vodId, source, controller.signal)
-      .then((d) => setDetail(d))
-      .catch((err) => {
-        if (err instanceof DOMException && err.name === 'AbortError') return;
-        setError(err instanceof Error ? err.message : '获取详情失败');
-      })
-      .finally(() => setLoading(false));
-    return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [item]);
+    if (!item) return;
+    router.prefetch('/watch');
+    void import('@/components/player-shell').catch(() => {});
+  }, [item, router]);
 
   useEffect(() => {
     if (!item) return;
@@ -102,7 +80,9 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
         vodId: item.vodId,
         index,
         title: item.name,
-        sourceUrl: item.sourceUrl,
+        sourceUrl: source?.url,
+        detail: source?.detail,
+        episodeUrl: detail.episodes[index],
       })
     );
   };

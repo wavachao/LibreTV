@@ -4,9 +4,10 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import { useRouter, useSearchParams } from 'next/navigation';
+import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
-import { api } from '@/lib/client-api';
+import { videoDetailOptions } from '@/lib/client-api';
 // 播放器（artplayer + hls.js）按需加载：拆出独立 chunk，不占首屏 First Load JS
 const PlayerShell = dynamic(() => import('@/components/player-shell').then((m) => m.PlayerShell), {
   ssr: false,
@@ -36,6 +37,7 @@ import { useAuth } from '@/components/auth';
 import { resolveSource, useAppStore } from '@/lib/store';
 import { qualityKey, qualityLabel, streamQualityText } from '@/lib/quality';
 import type { StreamQuality } from '@/lib/types';
+import { playbackKey } from '@/lib/playback-health';
 import {
   clearProgress,
   progressKeyOf,
@@ -61,7 +63,6 @@ export default function WatchPage() {
 
 function WatchContent() {
   const searchParams = useSearchParams();
-  const router = useRouter();
   const store = useAppStore();
   const { verified, checked, openLogin } = useAuth();
   const { toast } = useToast();
@@ -73,13 +74,15 @@ function WatchContent() {
   const indexParam = parseInt(searchParams.get('index') || '0', 10) || 0;
 
   const [reversed, setReversed] = useState(false);
-  const [switchOpen, setSwitchOpen] = useState(false);
+  const [switchTarget, setSwitchTarget] = useState<{ host: HTMLElement | null } | null>(null);
   const [skipPanelOpen, setSkipPanelOpen] = useState(false);
   const [cinema, setCinema] = useState(false);
   const [episodeInput, setEpisodeInput] = useState('');
   const [streamInfo, setStreamInfo] = useState<StreamQuality>({});
   // 播放器对外暴露的精确时间读取接口（「记录当前」用），随播放器卸载置空
   const playerApiRef = useRef<PlayerSkipApi | null>(null);
+  const openSwitchSource = useCallback(() => setSwitchTarget({ host: playerApiRef.current?.getFullscreenHost() ?? null }), []);
+  const closeSwitchSource = useCallback(() => setSwitchTarget(null), []);
   // 播放框：小屏「跳过标记」抽屉要按它的底边算剩余高度，避免压住画面
   const playerFrameRef = useRef<HTMLDivElement | null>(null);
   const [sheetMaxHeight, setSheetMaxHeight] = useState<number | undefined>(undefined);
@@ -119,10 +122,8 @@ function WatchContent() {
 
   // 详情查询：无 id（纯直连链接分享）时跳过
   const detailQuery = useQuery({
-    queryKey: ['detail', sourceKey, vodId, source?.url],
-    queryFn: ({ signal }) => api.detail(vodId, source!, signal),
+    ...videoDetailOptions(vodId, source),
     enabled: Boolean(source && vodId && verified),
-    staleTime: 5 * 60_000,
   });
 
   const lineParam = Math.max(0, parseInt(searchParams.get('line') || '0', 10) || 0);
@@ -165,24 +166,23 @@ function WatchContent() {
   const goEpisode = useCallback(
     (index: number) => {
       if (!Number.isInteger(index) || index < 0 || index >= episodes.length) return;
-      if (autoNextTimer.current) clearTimeout(autoNextTimer.current);
       const sp = new URLSearchParams(searchParams.toString());
       sp.set('index', String(index));
       sp.set('url', episodes[index] || directUrl);
       sp.delete('position');
-      router.replace(`/watch?${sp.toString()}`, { scroll: false });
+      window.history.replaceState(null, '', `/watch?${sp.toString()}`);
     },
-    [router, searchParams, episodes, directUrl]
+    [searchParams, episodes, directUrl]
   );
 
   // 进度恢复优先级：URL position 参数 > IndexedDB 记录
+  const urlPosition = Number(searchParams.get('position')) || 0;
   const getRestorePosition = useCallback(async () => {
-    const urlPos = parseInt(searchParams.get('position') || '0', 10) || 0;
-    if (urlPos > 0) return urlPos;
+    if (urlPosition > 0) return urlPosition;
     if (!vodId) return 0;
     const entry = await db.progress.get(progressKeyOf(sourceKey, vodId, currentIndex));
-    return entry?.position ?? 0;
-  }, [searchParams, sourceKey, vodId, currentIndex]);
+    return entry && entry.position > 10 ? entry.position : 0;
+  }, [urlPosition, sourceKey, vodId, currentIndex]);
 
   // 写入观看历史（进入页面即记录，进度后续增量更新）
   useEffect(() => {
@@ -216,16 +216,10 @@ function WatchContent() {
     [sourceKey, vodId, currentIndex, currentUrl]
   );
 
-  // 自动连播的 800ms 延迟切集要在卸载时取消，避免离开页面后跳转
-  const autoNextTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => {
-    if (autoNextTimer.current) clearTimeout(autoNextTimer.current);
-  }, []);
-
   const handleEnded = useCallback(() => {
     if (vodId) clearProgress(sourceKey, vodId, currentIndex).catch(() => {});
     if (store.autoplayNext && currentIndex < episodes.length - 1) {
-      autoNextTimer.current = setTimeout(() => goEpisode(currentIndex + 1), 800);
+      goEpisode(currentIndex + 1);
     }
   }, [store.autoplayNext, currentIndex, episodes.length, goEpisode, sourceKey, vodId]);
 
@@ -291,7 +285,7 @@ function WatchContent() {
     );
   }
 
-  if (!source) {
+  if (!source && !currentUrl) {
     return (
       <div className="min-h-screen flex items-center justify-center px-4">
         <div className="text-center max-w-md">
@@ -347,7 +341,7 @@ function WatchContent() {
                 <PlayerShell
                   url={currentUrl}
                   title={videoTitle}
-                  sourceName={source.name}
+                  sourceName={source?.name}
                   episodeCount={episodes.length}
                   currentEpisode={currentIndex}
                   onSelectEpisode={goEpisode}
@@ -361,14 +355,14 @@ function WatchContent() {
                   onPendingStart={setPendingStart}
                   onPlayerApi={(api) => { playerApiRef.current = api; }}
                   onRecordSegment={handleRecordSegment}
-                  episodeKey={`${sourceKey}:${vodId}:${lineIndex}:${currentIndex}`}
-                  nextUrl={currentIndex + 1 < episodes.length ? episodes[currentIndex + 1] : undefined}
-                  nextEpisodeKey={currentIndex + 1 < episodes.length ? `${sourceKey}:${vodId}:${lineIndex}:${currentIndex + 1}` : undefined}
+                  episodeKey={vodId ? playbackKey(sourceKey, vodId, lineIndex, currentIndex) : undefined}
+                  nextUrl={episodes[currentIndex + 1]}
+                  nextEpisodeKey={episodes[currentIndex + 1] ? playbackKey(sourceKey, vodId, lineIndex, currentIndex + 1) : undefined}
                   getRestorePosition={getRestorePosition}
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}
                   onEnded={handleEnded}
-                  onRequestSwitchSource={() => setSwitchOpen(true)}
+                  onRequestSwitchSource={openSwitchSource}
                   hasPrevEpisode={currentIndex > 0}
                   hasNextEpisode={episodes.length > 0 && currentIndex < episodes.length - 1}
                   onPrevEpisode={() => goEpisode(currentIndex - 1)}
@@ -502,21 +496,25 @@ function WatchContent() {
               <div className="watch-source-heading"><span className="watch-dot" />当前播放线路</div>
               <div className="flex items-center justify-between gap-3 mt-3">
                 <div className="min-w-0">
-                  <p className="text-sm font-medium text-content truncate">{source.name}</p>
+                  <p className="text-sm font-medium text-content truncate">{source?.name || '直连播放'}</p>
                   <p className="text-xs text-faint mt-1">卡顿或无法播放时可以换一条线路</p>
                 </div>
-                <button className="watch-source-switch" onClick={() => setSwitchOpen(true)}><Icon name="refresh" className="w-3.5 h-3.5" />换源</button>
+                <button className="watch-source-switch" onClick={openSwitchSource}><Icon name="refresh" className="w-3.5 h-3.5" />换源</button>
               </div>
               {playLines && playLines.length > 1 && <label className="block text-xs text-muted mt-3">
                 本源播放线路
                 <select aria-label="本源播放线路" className="input w-full mt-1" value={lineIndex} onChange={(e) => {
                   const sp = new URLSearchParams(searchParams.toString());
                   sp.set('line', e.target.value);
-                  sp.delete('url');
+                  const target = playLines[Number(e.target.value)]?.episodes[currentIndex];
+                  if (!target) return;
+                  sp.set('url', target);
                   sp.delete('position');
-                  router.replace(`/watch?${sp.toString()}`, { scroll: false });
+                  const position = playerApiRef.current?.getCurrentTime() ?? 0;
+                  if (position > 0) sp.set('position', String(position));
+                  window.history.replaceState(null, '', `/watch?${sp.toString()}`);
                 }}>
-                  {playLines.map((line, i) => <option key={i} value={i}>{line.name} · {line.episodes.length} 集</option>)}
+                  {playLines.map((line, i) => <option key={i} value={i} disabled={!line.episodes[currentIndex]}>{line.name} · {line.episodes.length} 集</option>)}
                 </select>
               </label>}
             </div>
@@ -584,15 +582,18 @@ function WatchContent() {
         </div>
       </main>
 
-      {switchOpen && (
-        <SwitchSourceModal
+      {switchTarget && (() => {
+        const modal = <SwitchSourceModal
           currentTitle={videoTitle}
+          currentYear={info?.year}
           currentSourceKey={sourceKey}
           currentVodId={vodId}
           currentIndex={currentIndex}
-          onClose={() => setSwitchOpen(false)}
-        />
-      )}
+          getPosition={() => playerApiRef.current?.getCurrentTime() ?? 0}
+          onClose={closeSwitchSource}
+        />;
+        return switchTarget.host ? createPortal(modal, switchTarget.host) : modal;
+      })()}
     </div>
   );
 }
